@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ class Compressor:
 
     def __init__(self, config: Optional[CompressionConfig] = None):
         self.config = config or CompressionConfig()
+        self.logger = logging.getLogger(__name__)
 
     def compress(self, source: Path) -> Path:
         if not source.exists():
@@ -45,8 +47,9 @@ class Compressor:
                 if compressed_path.exists():
                     return compressed_path
             except subprocess.CalledProcessError:
-                # Fall back to simple copy below
-                pass
+                self.logger.warning("ffmpeg compression failed for %s; copying instead", source)
+            except FileNotFoundError:
+                self.logger.warning("ffmpeg not available on PATH; copying instead")
 
         shutil.copy2(source, compressed_path)
         return compressed_path

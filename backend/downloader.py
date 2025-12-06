@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -8,6 +9,7 @@ from typing import Optional
 class VideoDownloader:
     def __init__(self, download_root: Optional[Path] = None):
         self.download_root = download_root or Path(tempfile.gettempdir())
+        self.logger = logging.getLogger(__name__)
 
     def download_youtube(self, url: str) -> Path:
         """Attempt to download a YouTube video using ``yt-dlp``.
@@ -38,8 +40,12 @@ class VideoDownloader:
             except subprocess.CalledProcessError as exc:  # noqa: PERF203
                 error_log = temp_dir / "download_error.log"
                 error_log.write_text(exc.stderr or exc.stdout or str(exc), encoding="utf-8")
+                self.logger.warning("yt-dlp failed for %s, falling back to placeholder", url)
+            except FileNotFoundError:
+                self.logger.warning("yt-dlp not available on PATH; falling back to placeholder")
 
         # Offline-friendly fallback
+        self.logger.info("Using placeholder download for %s", url)
         output_path.write_text("synthetic video bytes", encoding="utf-8")
         return output_path
 

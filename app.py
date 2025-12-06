@@ -7,6 +7,7 @@ import logging
 from backend.compression import CompressionConfig
 from backend.downloader import VideoDownloader
 from backend.jobs import Job, JobQueue
+from backend.notifier import Notifier
 from backend.storage import Storage
 from backend.summarizer import CloudSummarizerClient
 
@@ -21,7 +22,8 @@ class VideoSummarizerApp:
         self.storage = Storage()
         self.summarizer = CloudSummarizerClient()
         self.downloader = VideoDownloader()
-        self.job_queue = JobQueue(self.storage, self.summarizer, self.downloader)
+        self.notifier = Notifier()
+        self.job_queue = JobQueue(self.storage, self.summarizer, self.downloader, self.notifier)
         self.event_queue: queue.Queue[Job] = queue.Queue()
         self.jobs: dict[str, Job] = {}
         self.job_queue.add_listener(self.event_queue.put)

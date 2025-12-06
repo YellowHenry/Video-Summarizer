@@ -8,6 +8,7 @@ from typing import Callable, Optional
 
 from .compression import CompressionConfig, Compressor
 from .downloader import VideoDownloader
+from .notifier import Notifier
 from .storage import Storage
 from .summarizer import CloudSummarizerClient
 
@@ -32,10 +33,11 @@ class Job:
 
 
 class JobQueue:
-    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: VideoDownloader):
+    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: VideoDownloader, notifier: Notifier | None = None):
         self.storage = storage
         self.summarizer = summarizer
         self.downloader = downloader
+        self.notifier = notifier or Notifier()
         self.queue: queue.Queue[Job] = queue.Queue()
         self.listeners: list[Callable[[Job], None]] = []
         self.logger = logging.getLogger(__name__)
@@ -86,6 +88,11 @@ class JobQueue:
         self._publish(job)
         summary = self.summarizer.summarize(compressed)
         job.summary_path = self.storage.store_summary(job.id, summary)
+
+        if job.requester_email:
+            subject = f"Your video summary for job {job.id} is ready"
+            body = summary if len(summary) < 2000 else summary[:2000] + "..."
+            self.notifier.notify(job.requester_email, subject, body)
 
         job.status = "complete"
         self._publish(job)
