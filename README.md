@@ -1,6 +1,6 @@
 # Video Summarizer
 
-A desktop-friendly demonstration of a video-summarization service. Users can submit local files or YouTube URLs via a Tkinter front-end, while a background worker compresses, summarizes, and persists the generated summaries. The pipeline now attempts real YouTube downloads (via `yt-dlp`), compression (via `ffmpeg` when available), and OpenAI-powered transcription + summarization when provided an API key, while still remaining offline-friendly via fallbacks.
+A desktop-friendly demonstration of a video-summarization service. Users can submit local files or YouTube URLs via a Tkinter front-end, while a background worker compresses, summarizes, and persists the generated summaries. The pipeline attempts real YouTube downloads (via `yt-dlp`), compression (via `ffmpeg` when available), and OpenAI-powered transcription + summarization when provided an API key, while still remaining offline-friendly via fallbacks.
 
 ## Features
 - Tkinter UI for uploads (file picker or YouTube link) with configurable bitrate slider.
@@ -55,9 +55,7 @@ If you want to verify the pipeline without launching the UI, run the bundled smo
 python smoke_test.py
 ```
 
-This creates a synthetic media file, runs it through download → compression → summarization, and reports the saved summary path. If
-you have `OPENAI_API_KEY` or `SUMMARIZER_HTTP_ENDPOINT` configured, the smoke test uploads a small WAV file so it exercises your
-actual cloud provider instead of the local fallback.
+This creates a synthetic media file, runs it through download → compression → summarization, and reports the saved summary path. If you have `OPENAI_API_KEY` or `SUMMARIZER_HTTP_ENDPOINT` configured, the smoke test uploads a small WAV file so it exercises your actual cloud provider instead of the local fallback.
 
 ### Cloud summarization
 Configure one of these options to use real cloud services:
