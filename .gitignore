@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.DS_Store
+smoke_input.mp4
+storage/
+venv/
+.venv/
