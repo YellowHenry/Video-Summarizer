@@ -1,10 +1,14 @@
+import logging
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import requests
+try:
+    import requests
+except ImportError:  # pragma: no cover - optional dependency
+    requests = None
 
 try:
     from openai import OpenAI
@@ -14,49 +18,103 @@ except ImportError:  # pragma: no cover - optional dependency
 
 @dataclass
 class SummarizerConfig:
-    endpoint: str = "https://api.example.com/summarize"
-    api_key: Optional[str] = os.getenv("SUMMARIZER_API_KEY")
-    model: str = "long-video-1.0"
+    api_key: Optional[str] = os.getenv("OPENAI_API_KEY") or os.getenv("SUMMARIZER_API_KEY")
+    model: str = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")
     transcription_model: str = os.getenv("SUMMARIZER_TRANSCRIBE_MODEL", "whisper-1")
+    base_url: Optional[str] = os.getenv("OPENAI_BASE_URL") or os.getenv("AZURE_OPENAI_ENDPOINT")
+    endpoint: Optional[str] = os.getenv("SUMMARIZER_HTTP_ENDPOINT")
+    organization: Optional[str] = os.getenv("OPENAI_ORG")
+    project: Optional[str] = os.getenv("OPENAI_PROJECT")
+    timeout: int = int(os.getenv("SUMMARIZER_TIMEOUT", "120"))
+    api_version: Optional[str] = os.getenv("AZURE_OPENAI_API_VERSION")
 
 
 class CloudSummarizerClient:
     def __init__(self, config: Optional[SummarizerConfig] = None):
         self.config = config or SummarizerConfig()
-        self.client = OpenAI(api_key=self.config.api_key) if OpenAI and self.config.api_key else None
+        self.client = (
+            OpenAI(
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                organization=self.config.organization,
+                project=self.config.project,
+                timeout=self.config.timeout,
+                api_version=self.config.api_version,
+            )
+            if OpenAI and self.config.api_key
+            else None
+        )
+        self.logger = logging.getLogger(__name__)
 
     def summarize(self, video: Path) -> str:
-        if self.config.api_key and self.config.endpoint and self.config.endpoint != SummarizerConfig.endpoint:
-            return self.summarize_via_http(video)
+        """Summarize a video using configured cloud providers.
 
-        if self.client:
+        When cloud settings are provided, failures surface as exceptions so
+        misconfigurations do not silently fall back to local stubs. If no
+        cloud provider is configured, a concise local placeholder summary is
+        returned so the rest of the pipeline can still execute.
+        """
+
+        cloud_configured = bool(self.config.api_key or self.config.endpoint)
+
+        # HTTP endpoint takes precedence when explicitly configured
+        if self.config.endpoint:
+            if not requests:
+                raise RuntimeError(
+                    "requests is required for HTTP summarization; install it via requirements.txt"
+                )
+            try:
+                return self.summarize_via_http(video)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error("HTTP summarization failed: %s", exc)
+                if not self.client:
+                    raise
+
+        # Direct OpenAI/Azure path
+        if self.config.api_key:
+            if not self.client:
+                raise RuntimeError("openai package is required when OPENAI_API_KEY is set")
             try:
                 transcript = self._transcribe_with_openai(video)
                 if transcript:
                     return self._summarize_with_openai(transcript)
-            except Exception:
-                # Fall back to stub if OpenAI call fails
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error("OpenAI summarization failed: %s", exc)
+                if cloud_configured:
+                    raise
+
+        if cloud_configured:
+            raise RuntimeError("Cloud summarization was configured but all providers failed")
 
         time.sleep(1)
         return (
             "Concise, conceptually faithful summary generated locally. Set "
-            "SUMMARIZER_API_KEY to enable cloud transcription + summarization."
+            "OPENAI_API_KEY (or SUMMARIZER_API_KEY) to enable live Whisper + GPT "
+            "summaries, or provide SUMMARIZER_HTTP_ENDPOINT for a custom "
+            "compatible API."
         )
 
     def summarize_via_http(self, video: Path) -> str:
+        if not requests:
+            raise RuntimeError("requests is required for HTTP summarization; install it via requirements.txt")
+        if not self.config.endpoint:
+            raise RuntimeError("SUMMARIZER_HTTP_ENDPOINT must be set for HTTP summarization")
         headers = {"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}
-        files = {"file": video.read_bytes()}
-        response = requests.post(
-            self.config.endpoint,
-            headers=headers,
-            data={"model": self.config.model},
-            files=files,
-            timeout=60,
-        )
+        with video.open("rb") as handle:
+            files = {"file": (video.name, handle, "application/octet-stream")}
+            response = requests.post(
+                self.config.endpoint,
+                headers=headers,
+                data={"model": self.config.model},
+                files=files,
+                timeout=self.config.timeout,
+            )
         response.raise_for_status()
         payload = response.json()
-        return payload.get("summary") or ""
+        summary = payload.get("summary")
+        if not summary:
+            raise RuntimeError("Cloud summarization endpoint did not return a 'summary' field")
+        return summary
 
     def _transcribe_with_openai(self, video: Path) -> str:
         if not self.client:
@@ -67,7 +125,14 @@ class CloudSummarizerClient:
                 file=handle,
                 response_format="text",
             )
-        return str(transcription)
+
+        normalized = str(transcription).strip()
+        if not normalized:
+            normalized = (
+                "Audio contained no discernible speech. Produce a concise summary "
+                "noting the absence of spoken content."
+            )
+        return normalized
 
     def _summarize_with_openai(self, transcript: str) -> str:
         if not self.client:
