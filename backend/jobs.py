@@ -33,7 +33,7 @@ class Job:
 
 
 class JobQueue:
-    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: VideoDownloader, notifier: Notifier | None = None):
+    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: VideoDownloader, notifier: Optional[Notifier] = None):
         self.storage = storage
         self.summarizer = summarizer
         self.downloader = downloader
