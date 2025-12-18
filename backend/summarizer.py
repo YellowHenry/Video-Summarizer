@@ -39,7 +39,6 @@ class CloudSummarizerClient:
                 organization=self.config.organization,
                 project=self.config.project,
                 timeout=self.config.timeout,
-                api_version=self.config.api_version,
             )
             if OpenAI and self.config.api_key
             else None
@@ -116,10 +115,55 @@ class CloudSummarizerClient:
             raise RuntimeError("Cloud summarization endpoint did not return a 'summary' field")
         return summary
 
+    def _extract_audio(self, video: Path) -> Path:
+        """Extract audio from video to reduce file size for transcription."""
+        import shutil
+        import subprocess
+        import tempfile
+        
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            # If ffmpeg not available, return original (will likely fail if too large)
+            self.logger.warning("ffmpeg not available, using original video file")
+            return video
+        
+        temp_dir = Path(tempfile.mkdtemp(prefix="audio_extract_"))
+        audio_path = temp_dir / f"{video.stem}.m4a"
+        
+        # Extract audio only, using m4a format (smaller than mp4)
+        command = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(video),
+            "-vn",  # No video
+            "-acodec", "aac",
+            "-b:a", "64k",  # Low bitrate for speech
+            "-ar", "16000",  # Sample rate (Whisper works well with 16kHz)
+            str(audio_path),
+        ]
+        
+        try:
+            subprocess.run(command, check=True, capture_output=True)
+            if audio_path.exists() and audio_path.stat().st_size < 25 * 1024 * 1024:  # 25MB limit
+                self.logger.info("Extracted audio: %s (%.1f MB)", audio_path, audio_path.stat().st_size / (1024 * 1024))
+                return audio_path
+            elif audio_path.exists():
+                self.logger.warning("Extracted audio still too large: %.1f MB", audio_path.stat().st_size / (1024 * 1024))
+        except subprocess.CalledProcessError as exc:
+            self.logger.warning("Audio extraction failed: %s", exc)
+        
+        # Fall back to original if extraction failed
+        return video
+
     def _transcribe_with_openai(self, video: Path) -> str:
         if not self.client:
             raise RuntimeError("openai package is not installed")
-        with video.open("rb") as handle:
+        
+        # Extract audio first to reduce file size (Whisper only needs audio)
+        audio_file = self._extract_audio(video)
+        
+        with audio_file.open("rb") as handle:
             transcription = self.client.audio.transcriptions.create(
                 model=self.config.transcription_model,
                 file=handle,
