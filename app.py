@@ -5,23 +5,23 @@ from pathlib import Path
 import logging
 
 from backend.compression import CompressionConfig
-from backend.downloader import VideoDownloader
+from backend.downloader import AudioDownloader
 from backend.jobs import Job, JobQueue
 from backend.notifier import Notifier
 from backend.storage import Storage
 from backend.summarizer import CloudSummarizerClient
 
 
-class VideoSummarizerApp:
+class AudioSummarizerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Video Summarizer")
-        self.root.geometry("720x520")
+        self.root.title("Audio Summarizer")
+        self.root.geometry("720x480")
         logging.basicConfig(level=logging.INFO)
 
         self.storage = Storage()
         self.summarizer = CloudSummarizerClient()
-        self.downloader = VideoDownloader()
+        self.downloader = AudioDownloader()
         self.notifier = Notifier()
         self.job_queue = JobQueue(self.storage, self.summarizer, self.downloader, self.notifier)
         self.event_queue: queue.Queue[Job] = queue.Queue()
@@ -35,39 +35,44 @@ class VideoSummarizerApp:
         self.root.after(200, self._process_job_events)
 
     def _build_form(self) -> None:
-        form = ttk.LabelFrame(self.root, text="Submit a video")
+        form = ttk.LabelFrame(self.root, text="Submit audio")
         form.pack(fill="x", padx=10, pady=10)
 
         path_row = ttk.Frame(form)
         path_row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(path_row, text="Local video file:").pack(side="left")
-        self.video_path_var = tk.StringVar()
-        ttk.Entry(path_row, textvariable=self.video_path_var, width=50).pack(side="left", padx=5)
+        ttk.Label(path_row, text="Local file (audio or video):").pack(side="left")
+        self.audio_path_var = tk.StringVar()
+        ttk.Entry(path_row, textvariable=self.audio_path_var, width=50).pack(side="left", padx=5)
         ttk.Button(path_row, text="Browse", command=self._choose_file).pack(side="left")
 
         url_row = ttk.Frame(form)
         url_row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(url_row, text="YouTube URL:").pack(side="left")
+        ttk.Label(url_row, text="YouTube URL (audio):").pack(side="left")
         self.youtube_var = tk.StringVar()
         ttk.Entry(url_row, textvariable=self.youtube_var, width=50).pack(side="left", padx=5)
+
+        mode_row = ttk.Frame(form)
+        mode_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(mode_row, text="Transcript mode:").pack(side="left")
+        self.transcript_mode = tk.StringVar(value="prefer_captions")
+        ttk.Radiobutton(
+            mode_row,
+            text="Prefer YouTube captions (fallback Whisper)",
+            variable=self.transcript_mode,
+            value="prefer_captions",
+        ).pack(side="left", padx=4)
+        ttk.Radiobutton(
+            mode_row,
+            text="Always Whisper",
+            variable=self.transcript_mode,
+            value="whisper_only",
+        ).pack(side="left", padx=4)
 
         email_row = ttk.Frame(form)
         email_row.pack(fill="x", padx=8, pady=4)
         ttk.Label(email_row, text="Notify email (optional):").pack(side="left")
         self.email_var = tk.StringVar()
         ttk.Entry(email_row, textvariable=self.email_var, width=30).pack(side="left", padx=5)
-
-        compression_row = ttk.Frame(form)
-        compression_row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(compression_row, text="Target bitrate (kbps):").pack(side="left")
-        self.bitrate_var = tk.IntVar(value=800)
-        ttk.Scale(
-            compression_row,
-            from_=400,
-            to=2400,
-            orient=tk.HORIZONTAL,
-            variable=self.bitrate_var,
-        ).pack(side="left", fill="x", expand=True, padx=6)
 
         button_row = ttk.Frame(form)
         button_row.pack(fill="x", padx=8, pady=4)
@@ -84,6 +89,7 @@ class VideoSummarizerApp:
             self.tree.column(col, width=200 if col != "status" else 120)
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._handle_select)
+        self.tree.bind("<Double-1>", self._handle_double_click)
 
     def _build_summary_panel(self) -> None:
         panel = ttk.LabelFrame(self.root, text="Summary")
@@ -92,12 +98,18 @@ class VideoSummarizerApp:
         self.summary_text.pack(fill="both", expand=True)
 
     def _choose_file(self) -> None:
-        file_path = filedialog.askopenfilename(filetypes=[["Video files", "*.mp4;*.mov;*.mkv;*.avi"], ["All", "*"]])
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ["Audio files", "*.mp3;*.m4a;*.wav;*.flac;*.aac;*.ogg;*.opus"],
+                ["Video files", "*.mp4;*.mov;*.mkv;*.avi;*.webm"],
+                ["All", "*"],
+            ]
+        )
         if file_path:
-            self.video_path_var.set(file_path)
+            self.audio_path_var.set(file_path)
 
     def _submit_job(self) -> None:
-        path = Path(self.video_path_var.get()) if self.video_path_var.get() else None
+        path = Path(self.audio_path_var.get()) if self.audio_path_var.get() else None
         url = self.youtube_var.get().strip() or None
         if path and not path.exists():
             messagebox.showerror("File not found", f"The file {path} does not exist.")
@@ -106,8 +118,13 @@ class VideoSummarizerApp:
             messagebox.showerror("Missing input", "Please choose a file or provide a YouTube URL.")
             return
 
-        compression = CompressionConfig(target_bitrate_kbps=int(self.bitrate_var.get()))
-        job = Job(video_path=path, youtube_url=url, requester_email=self.email_var.get() or None, compression=compression)
+        job = Job(
+            audio_path=path,
+            youtube_url=url,
+            requester_email=self.email_var.get() or None,
+            compression=CompressionConfig(),
+            prefer_youtube_captions=self.transcript_mode.get() == "prefer_captions",
+        )
         self.jobs[job.id] = job
         self.job_queue.submit(job)
         self._add_or_update_row(job)
@@ -115,9 +132,9 @@ class VideoSummarizerApp:
 
     def _add_or_update_row(self, job: Job) -> None:
         if job.id not in self.tree.get_children(""):
-            self.tree.insert("", "end", iid=job.id, values=(job.id, job.describe(), job.status))
+            self.tree.insert("", "end", iid=job.id, values=(job.display_id(), job.describe(), job.status))
         else:
-            self.tree.item(job.id, values=(job.id, job.describe(), job.status))
+            self.tree.item(job.id, values=(job.display_id(), job.describe(), job.status))
 
     def _process_job_events(self) -> None:
         while not self.event_queue.empty():
@@ -139,6 +156,19 @@ class VideoSummarizerApp:
         if job and job.summary_path:
             self._display_summary(job)
 
+    def _handle_double_click(self, _event: tk.Event) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        job_id = selection[0]
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        info_lines = [f"Job ID: {job.id}"]
+        if job.summary_path:
+            info_lines.append(f"Summary path: {job.summary_path}")
+        messagebox.showinfo("Job details", "\n".join(info_lines))
+
     def _display_summary(self, job: Job) -> None:
         if not job.summary_path or not job.summary_path.exists():
             return
@@ -147,13 +177,13 @@ class VideoSummarizerApp:
         self.summary_text.insert(tk.END, content)
 
     def _clear_form(self) -> None:
-        self.video_path_var.set("")
+        self.audio_path_var.set("")
         self.youtube_var.set("")
 
 
 def main() -> None:
     root = tk.Tk()
-    VideoSummarizerApp(root)
+    AudioSummarizerApp(root)
     root.mainloop()
 
 

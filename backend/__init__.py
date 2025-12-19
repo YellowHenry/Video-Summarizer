@@ -1,1 +1,1 @@
-"""Backend components for the video summarizer application."""
+"""Backend components for the audio summarizer application."""

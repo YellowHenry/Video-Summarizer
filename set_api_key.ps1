@@ -11,7 +11,7 @@ $env:OPENAI_API_KEY = "sk-proj-XjVvPYAXANv2oTqBtbMMq1tt7VPvS3BIniLAQ0T1UfWTgiAmE
 # $env:SUMMARIZER_TRANSCRIBE_MODEL = "whisper-1"
 
 # Run the app
-Write-Host "Starting Video Summarizer app..." -ForegroundColor Green
+Write-Host "Starting Audio Summarizer app..." -ForegroundColor Green
 Write-Host "Your OpenAI API key is set. The app will use:" -ForegroundColor Yellow
 $transcribeModel = if ($env:SUMMARIZER_TRANSCRIBE_MODEL) { $env:SUMMARIZER_TRANSCRIBE_MODEL } else { "whisper-1" }
 $summarizeModel = if ($env:SUMMARIZER_MODEL) { $env:SUMMARIZER_MODEL } else { "gpt-4o-mini" }
@@ -19,4 +19,3 @@ Write-Host "  - Transcription model: $transcribeModel" -ForegroundColor Cyan
 Write-Host "  - Summarization model: $summarizeModel" -ForegroundColor Cyan
 Write-Host ""
 python app.py
-

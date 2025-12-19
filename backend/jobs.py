@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .compression import CompressionConfig, Compressor
-from .downloader import VideoDownloader
+from .downloader import AudioDownloader
 from .notifier import Notifier
 from .storage import Storage
 from .summarizer import CloudSummarizerClient
@@ -15,8 +15,10 @@ from .summarizer import CloudSummarizerClient
 
 @dataclass
 class Job:
-    video_path: Optional[Path] = None
+    audio_path: Optional[Path] = None
     youtube_url: Optional[str] = None
+    display_name: Optional[str] = None
+    prefer_youtube_captions: bool = True
     requester_email: Optional[str] = None
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -27,13 +29,16 @@ class Job:
     def describe(self) -> str:
         if self.youtube_url:
             return f"YouTube URL {self.youtube_url}"
-        if self.video_path:
-            return str(self.video_path)
+        if self.audio_path:
+            return str(self.audio_path)
         return "unknown source"
+
+    def display_id(self) -> str:
+        return self.display_name or self.id
 
 
 class JobQueue:
-    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: VideoDownloader, notifier: Optional[Notifier] = None):
+    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: AudioDownloader, notifier: Optional[Notifier] = None):
         self.storage = storage
         self.summarizer = summarizer
         self.downloader = downloader
@@ -73,24 +78,28 @@ class JobQueue:
         job.status = "downloading"
         self._publish(job)
         if job.youtube_url:
-            local_copy = self.downloader.download_youtube(job.youtube_url)
-        elif job.video_path:
-            local_copy = self.downloader.copy_local(job.video_path)
+            local_copy, title = self.downloader.download_youtube(job.youtube_url)
+            job.display_name = title or job.display_name
+        elif job.audio_path:
+            local_copy = self.downloader.copy_local(job.audio_path)
         else:
-            raise ValueError("Job missing both video_path and youtube_url")
+            raise ValueError("Job missing both audio_path and youtube_url")
 
-        job.status = "compressing"
+        job.status = "preprocessing"
         self._publish(job)
         compressed = Compressor(job.compression).compress(local_copy)
-        self.storage.store_compressed_copy(job.id, compressed)
-
         job.status = "summarizing"
         self._publish(job)
-        summary = self.summarizer.summarize(compressed)
+        stored_path = self.storage.store_compressed_copy(job.id, compressed)
+        summary = self.summarizer.summarize(
+            stored_path,
+            youtube_url=job.youtube_url,
+            prefer_youtube_captions=job.prefer_youtube_captions,
+        )
         job.summary_path = self.storage.store_summary(job.id, summary)
 
         if job.requester_email:
-            subject = f"Your video summary for job {job.id} is ready"
+            subject = f"Your audio summary for job {job.id} is ready"
             body = summary if len(summary) < 2000 else summary[:2000] + "..."
             self.notifier.notify(job.requester_email, subject, body)
 

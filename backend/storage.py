@@ -25,10 +25,10 @@ class Storage:
         text_path.write_text(summary_text, encoding="utf-8")
         return text_path
 
-    def store_compressed_copy(self, job_id: str, compressed_video: Path) -> Path:
+    def store_compressed_copy(self, job_id: str, media: Path) -> Path:
         summary_dir = self.config.base_dir / job_id
         summary_dir.mkdir(parents=True, exist_ok=True)
-        output_path = summary_dir / compressed_video.name
-        if compressed_video.resolve() != output_path.resolve():
-            output_path.write_bytes(compressed_video.read_bytes())
+        output_path = summary_dir / media.name
+        if media.resolve() != output_path.resolve():
+            output_path.write_bytes(media.read_bytes())
         return output_path

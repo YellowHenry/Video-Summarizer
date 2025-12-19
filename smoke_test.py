@@ -6,32 +6,27 @@ import wave
 from backend.jobs import JobQueue, Job
 from backend.storage import Storage
 from backend.summarizer import CloudSummarizerClient, SummarizerConfig
-from backend.downloader import VideoDownloader
+from backend.downloader import AudioDownloader
 
 
 def _build_input() -> Path:
-    """Generate a dummy media file that exercises configured providers."""
+    """Generate a dummy audio file that exercises configured providers."""
 
     config = SummarizerConfig()
-    if config.api_key or config.endpoint:
-        # Create a short silent WAV for Whisper/HTTP uploads
-        dummy = Path("smoke_input.wav")
-        with wave.open(dummy, "w") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(16000)
-            wav_file.writeframes(b"\x00\x00" * 16000)
-    else:
-        dummy = Path("smoke_input.mp4")
-        dummy.write_text("synthetic video bytes", encoding="utf-8")
+    dummy = Path("smoke_input.wav")
+    with wave.open(str(dummy), "w") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(b"\x00\x00" * 16000)
     return dummy
 
 
 def run_smoke_test(timeout: float = 10.0) -> Path:
     dummy = _build_input()
 
-    queue = JobQueue(Storage(), CloudSummarizerClient(), VideoDownloader())
-    job = Job(video_path=dummy)
+    queue = JobQueue(Storage(), CloudSummarizerClient(), AudioDownloader())
+    job = Job(audio_path=dummy)
     queue.submit(job)
 
     waited = 0.0
