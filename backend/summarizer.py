@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import subprocess
@@ -37,6 +38,13 @@ class SummarizerConfig:
     whisper_upload_limit_bytes: int = int(os.getenv("SUMMARIZER_WHISPER_LIMIT_BYTES", str(25 * 1024 * 1024)))
 
 
+@dataclass
+class SummarizeResult:
+    summary: str
+    transcript: Optional[str] = None
+    transcript_source: Optional[str] = None
+
+
 class CloudSummarizerClient:
     def __init__(self, config: Optional[SummarizerConfig] = None):
         self.config = config or SummarizerConfig()
@@ -53,23 +61,22 @@ class CloudSummarizerClient:
         )
         self.logger = logging.getLogger(__name__)
 
-    def summarize(self, audio: Path, youtube_url: Optional[str] = None, prefer_youtube_captions: bool = True) -> str:
-        """Summarize an audio file using configured cloud providers.
-
-        When cloud settings are provided, failures surface as exceptions so
-        misconfigurations do not silently fall back to local stubs. If no
-        cloud provider is configured, a concise local placeholder summary is
-        returned so the rest of the pipeline can still execute.
-        """
+    def summarize(self, audio: Path, youtube_url: Optional[str] = None, prefer_youtube_captions: bool = True) -> SummarizeResult:
+        """Summarize an audio file using configured cloud providers and return both the summary and raw transcript when available."""
 
         cloud_configured = bool(self.config.api_key or self.config.endpoint)
+        transcript: Optional[str] = None
+        transcript_source: Optional[str] = None
 
         # Try YouTube captions first if requested and OpenAI client is available
         if prefer_youtube_captions and youtube_url and self.client:
             captions = self._fetch_youtube_captions(youtube_url)
             if captions:
+                transcript = captions
+                transcript_source = "youtube_captions"
                 try:
-                    return self._summarize_with_openai(captions)
+                    summary = self._summarize_with_openai(captions)
+                    return SummarizeResult(summary=summary, transcript=transcript, transcript_source=transcript_source)
                 except Exception as exc:  # noqa: BLE001
                     self.logger.error("Summarization from YouTube captions failed: %s", exc)
                     if cloud_configured:
@@ -82,7 +89,8 @@ class CloudSummarizerClient:
                     "requests is required for HTTP summarization; install it via requirements.txt"
                 )
             try:
-                return self.summarize_via_http(audio)
+                summary = self.summarize_via_http(audio)
+                return SummarizeResult(summary=summary, transcript=transcript, transcript_source=transcript_source)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error("HTTP summarization failed: %s", exc)
                 if not self.client:
@@ -94,8 +102,10 @@ class CloudSummarizerClient:
                 raise RuntimeError("openai package is required when OPENAI_API_KEY is set")
             try:
                 transcript = self._transcribe_with_openai(audio)
+                transcript_source = "whisper"
                 if transcript:
-                    return self._summarize_with_openai(transcript)
+                    summary = self._summarize_with_openai(transcript)
+                    return SummarizeResult(summary=summary, transcript=transcript, transcript_source=transcript_source)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error("OpenAI summarization failed: %s", exc)
                 if cloud_configured:
@@ -105,12 +115,13 @@ class CloudSummarizerClient:
             raise RuntimeError("Cloud summarization was configured but all providers failed")
 
         time.sleep(1)
-        return (
+        placeholder = (
             "Concise, conceptually faithful summary generated locally. Set "
             "OPENAI_API_KEY (or SUMMARIZER_API_KEY) to enable live Whisper + GPT "
             "summaries, or provide SUMMARIZER_HTTP_ENDPOINT for a custom "
             "compatible API."
         )
+        return SummarizeResult(summary=placeholder, transcript=transcript, transcript_source=transcript_source)
 
     def _resolve_ffmpeg(self) -> Optional[str]:
         import shutil
@@ -402,7 +413,24 @@ class CloudSummarizerClient:
             try:
                 resp = requests.get(caption_url, timeout=self.config.timeout)
                 resp.raise_for_status()
-                text = self._parse_vtt(resp.text)
+                text_content = resp.text
+                # Some caption endpoints return an HLS playlist (.m3u8) pointing to VTT chunks; follow it.
+                if text_content.lstrip().startswith("#EXTM3U"):
+                    parts: list[str] = []
+                    for line in text_content.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        try:
+                            seg_resp = requests.get(line, timeout=self.config.timeout)
+                            seg_resp.raise_for_status()
+                            parts.append(seg_resp.text)
+                        except Exception as seg_exc:  # noqa: BLE001
+                            self.logger.info("Failed to fetch caption segment %s: %s", line, seg_exc)
+                            continue
+                    if parts:
+                        text_content = "\n".join(parts)
+                text = self._parse_caption_payload(text_content)
                 if text:
                     self.logger.info("Using YouTube auto captions for %s", url)
                     return text
@@ -411,10 +439,39 @@ class CloudSummarizerClient:
                 continue
         return None
 
-    def _parse_vtt(self, vtt_text: str) -> str:
-        """Simple VTT -> text parser."""
+    def _parse_caption_payload(self, caption_text: str) -> str:
+        """Parse YouTube captions returned as either VTT or JSON3 into human-readable text."""
+        # Try JSON3 first (contains "events" with "segs"/"utf8")
+        try:
+            payload = json.loads(caption_text)
+        except (ValueError, TypeError):
+            payload = None
+
+        if isinstance(payload, dict) and "events" in payload:
+            lines: list[str] = []
+            for event in payload.get("events", []):
+                segs = event.get("segs") or []
+                pieces: list[str] = []
+                for seg in segs:
+                    text = seg.get("utf8")
+                    if not text:
+                        continue
+                    cleaned = text.replace("\u00a0", " ").replace("\n", " ").strip()
+                    if cleaned:
+                        pieces.append(cleaned)
+                if pieces:
+                    line = " ".join(pieces)
+                    # Collapse multiple spaces for readability
+                    line = " ".join(line.split())
+                    if line:
+                        lines.append(line)
+            parsed = "\n".join(lines).strip()
+            if parsed:
+                return parsed
+
+        # Fallback: simple VTT parsing
         lines = []
-        for line in vtt_text.splitlines():
+        for line in caption_text.splitlines():
             if not line or line.startswith("WEBVTT") or "-->" in line:
                 continue
             lines.append(line.strip())

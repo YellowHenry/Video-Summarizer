@@ -10,7 +10,7 @@ from .compression import CompressionConfig, Compressor
 from .downloader import AudioDownloader
 from .notifier import Notifier
 from .storage import Storage
-from .summarizer import CloudSummarizerClient
+from .summarizer import CloudSummarizerClient, SummarizeResult
 
 
 @dataclass
@@ -24,6 +24,7 @@ class Job:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: str = "queued"
     summary_path: Optional[Path] = None
+    transcript_path: Optional[Path] = None
     error: Optional[str] = None
 
     def describe(self) -> str:
@@ -91,16 +92,18 @@ class JobQueue:
         job.status = "summarizing"
         self._publish(job)
         stored_path = self.storage.store_compressed_copy(job.id, compressed)
-        summary = self.summarizer.summarize(
+        result: SummarizeResult = self.summarizer.summarize(
             stored_path,
             youtube_url=job.youtube_url,
             prefer_youtube_captions=job.prefer_youtube_captions,
         )
-        job.summary_path = self.storage.store_summary(job.id, summary)
+        job.summary_path = self.storage.store_summary(job.id, result.summary)
+        if result.transcript:
+            job.transcript_path = self.storage.store_transcript(job.id, result.transcript)
 
         if job.requester_email:
             subject = f"Your audio summary for job {job.id} is ready"
-            body = summary if len(summary) < 2000 else summary[:2000] + "..."
+            body = result.summary if len(result.summary) < 2000 else result.summary[:2000] + "..."
             self.notifier.notify(job.requester_email, subject, body)
 
         job.status = "complete"

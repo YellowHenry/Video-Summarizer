@@ -25,6 +25,14 @@ class Storage:
         text_path.write_text(summary_text, encoding="utf-8")
         return text_path
 
+    def store_transcript(self, job_id: str, transcript_text: str) -> Path:
+        """Persist the raw transcript text for a job."""
+        summary_dir = self.config.base_dir / job_id
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = summary_dir / "transcript.txt"
+        transcript_path.write_text(transcript_text, encoding="utf-8")
+        return transcript_path
+
     def store_compressed_copy(self, job_id: str, media: Path) -> Path:
         summary_dir = self.config.base_dir / job_id
         summary_dir.mkdir(parents=True, exist_ok=True)
