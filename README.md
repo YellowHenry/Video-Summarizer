@@ -44,6 +44,10 @@ export SUMMARIZER_MAX_TOKENS=800               # chat completion cap
 export SUMMARIZER_CHUNK_SECONDS=2520           # chunk audio for Whisper (default 42 minutes)
 export SUMMARIZER_HTTP_ENDPOINT="https://example.com/summarize"  # alternative provider
 export FFMPEG_PATH="/usr/local/bin/ffmpeg"     # set if ffmpeg is not on PATH
+export YTDLP_EXTRACTOR_ARGS="youtube:player_client=android"  # override YouTube client if downloads 403
+export YTDLP_COOKIES="C:/path/to/cookies.txt"  # optional cookies for protected videos
+export YTDLP_COOKIES_FROM_BROWSER="chrome"     # optional: pull cookies directly from browser (yt-dlp supports many)
+export YTDLP_COOKIES_FROM_BROWSER_PROFILE="Default"  # optional: browser profile name (Default, Profile 1, etc.)
 export SMTP_HOST="smtp.sendgrid.net"           # enable email notifications
 export SMTP_PORT=587
 export SMTP_USER="apikey"

@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .config import HARDCODED_API_KEY
+from .config import (
+    HARDCODED_API_KEY,
+    HARDCODED_COOKIES_FROM_BROWSER,
+    HARDCODED_COOKIES_BROWSER_PROFILE,
+)
 
 try:
     import requests
@@ -263,6 +267,22 @@ class CloudSummarizerClient:
         # If everything failed, fall back to original (may still exceed limit and fail upstream)
         return source
 
+    def _candidate_profiles(self) -> list[str]:
+        """Return a single best Chrome profile to try."""
+        preferred = os.getenv("YTDLP_COOKIES_FROM_BROWSER_PROFILE") or HARDCODED_COOKIES_BROWSER_PROFILE or "Default"
+        chrome_dir = Path(os.getenv("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+        existing: list[str] = []
+        if chrome_dir.exists():
+            for path in chrome_dir.iterdir():
+                if path.is_dir() and (path.name == "Default" or path.name.startswith("Profile ")):
+                    existing.append(path.name)
+
+        if preferred in existing:
+            return [preferred]
+        if existing:
+            return [existing[0]]
+        return ["Default"]
+
     def _probe_duration_seconds(self, audio: Path) -> Optional[float]:
         ffprobe = self._resolve_ffprobe()
         if not ffprobe:
@@ -393,10 +413,50 @@ class CloudSummarizerClient:
             self.logger.info("requests not installed; cannot fetch YouTube captions")
             return None
 
-        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": False}
+        extractor_args_list = [
+            os.getenv("YTDLP_EXTRACTOR_ARGS", "youtube:player_client=tvhtml5desktop"),
+            "youtube:player_client=web_embedded",
+            "youtube:player_client=web_remix",
+            "youtube:player_client=default",
+        ]
+        ydl_opts_base = {"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": False}
+        browser_cookie = os.getenv("YTDLP_COOKIES_FROM_BROWSER") or HARDCODED_COOKIES_FROM_BROWSER
+        profiles = self._candidate_profiles()
+
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            info = None
+            for extractor_arg in extractor_args_list:
+                for profile in profiles:
+                    ydl_opts = dict(ydl_opts_base)
+                    ydl_opts["extractor_args"] = {"youtube": [extractor_arg]}
+                    if browser_cookie:
+                        ydl_opts["cookiesfrombrowser"] = (browser_cookie, profile, None, None)
+                        ydl_opts.pop("cookiefile", None)
+                    elif os.getenv("YTDLP_COOKIES"):
+                        ydl_opts["cookiefile"] = os.getenv("YTDLP_COOKIES")
+                        ydl_opts.pop("cookiesfrombrowser", None)
+                    else:
+                        raise RuntimeError("Cookies are required to fetch captions; set YTDLP_COOKIES_FROM_BROWSER or YTDLP_COOKIES.")
+                    try:
+                        self.logger.info("yt-dlp captions extractor=%s profile=%s", extractor_arg, profile)
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            info = ydl.extract_info(url, download=False)
+                        if info:
+                            raise_stop = True
+                            break
+                    except Exception as inner_exc:  # noqa: BLE001
+                        self.logger.debug(
+                            "Caption fetch failed extractor=%s profile=%s error=%s",
+                            extractor_arg,
+                            profile,
+                            inner_exc,
+                        )
+                        continue
+                else:
+                    continue
+                break
+            if not info:
+                return None
         except Exception as exc:  # noqa: BLE001
             self.logger.info("Failed to extract YouTube info for captions: %s", exc)
             return None
