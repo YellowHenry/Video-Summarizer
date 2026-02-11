@@ -11,6 +11,7 @@ from .downloader import AudioDownloader
 from .notifier import Notifier
 from .storage import Storage
 from .summarizer import CloudSummarizerClient, SummarizeResult
+from .vector_store import VectorStore
 
 
 @dataclass
@@ -39,11 +40,12 @@ class Job:
 
 
 class JobQueue:
-    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: AudioDownloader, notifier: Optional[Notifier] = None):
+    def __init__(self, storage: Storage, summarizer: CloudSummarizerClient, downloader: AudioDownloader, notifier: Optional[Notifier] = None, vector_store: Optional[VectorStore] = None):
         self.storage = storage
         self.summarizer = summarizer
         self.downloader = downloader
         self.notifier = notifier or Notifier()
+        self.vector_store = vector_store or VectorStore()
         self.queue: queue.Queue[Job] = queue.Queue()
         self.listeners: list[Callable[[Job], None]] = []
         self.logger = logging.getLogger(__name__)
@@ -97,9 +99,41 @@ class JobQueue:
             youtube_url=job.youtube_url,
             prefer_youtube_captions=job.prefer_youtube_captions,
         )
+        stub_prefix = "it seems that the transcript you intended to provide is missing"
+        is_stub = result.summary.strip().lower().startswith(stub_prefix)
+
+        if is_stub:
+            self.storage.delete_summary_and_transcript(job.id)
+            job.status = "failed"
+            job.error = "Transcript missing; summary was placeholder and has been removed."
+            self._publish(job)
+            return
+
         job.summary_path = self.storage.store_summary(job.id, result.summary)
+        # Index summary
+        try:
+            self.vector_store.add_text(
+                job.id,
+                result.summary,
+                job.youtube_url,
+                kind="summary",
+                file_path=job.summary_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Failed to index summary for job %s: %s", job.id, exc)
+
         if result.transcript:
             job.transcript_path = self.storage.store_transcript(job.id, result.transcript)
+            try:
+                self.vector_store.add_text(
+                    job.id,
+                    result.transcript,
+                    job.youtube_url,
+                    kind="transcript",
+                    file_path=job.transcript_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Failed to index transcript for job %s: %s", job.id, exc)
 
         if job.requester_email:
             subject = f"Your audio summary for job {job.id} is ready"

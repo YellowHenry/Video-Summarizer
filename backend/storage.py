@@ -40,3 +40,14 @@ class Storage:
         if media.resolve() != output_path.resolve():
             output_path.write_bytes(media.read_bytes())
         return output_path
+
+    def delete_summary_and_transcript(self, job_id: str) -> None:
+        """Remove summary/transcript artifacts for a job (used when summaries are invalid)."""
+        summary_dir = self.config.base_dir / job_id
+        for filename in ("summary.txt", "summary.json", "transcript.txt"):
+            path = summary_dir / filename
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
