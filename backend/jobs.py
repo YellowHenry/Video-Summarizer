@@ -19,6 +19,7 @@ class Job:
     audio_path: Optional[Path] = None
     youtube_url: Optional[str] = None
     display_name: Optional[str] = None
+    title: Optional[str] = None
     prefer_youtube_captions: bool = True
     requester_email: Optional[str] = None
     compression: CompressionConfig = field(default_factory=CompressionConfig)
@@ -26,6 +27,12 @@ class Job:
     status: str = "queued"
     summary_path: Optional[Path] = None
     transcript_path: Optional[Path] = None
+    transcript_source: Optional[str] = None
+    captions_attempted: Optional[bool] = None
+    captions_status: Optional[str] = None
+    captions_detail: Optional[str] = None
+    created_at: float = field(default_factory=lambda: __import__("time").time())
+    chat: list = field(default_factory=list)
     error: Optional[str] = None
 
     def describe(self) -> str:
@@ -73,16 +80,25 @@ class JobQueue:
                 job.status = "failed"
                 job.error = str(exc)
                 self.logger.exception("Job %s failed", job.id)
+                try:
+                    self.storage.store_metadata(job)
+                except Exception:
+                    pass
                 self._publish(job)
             finally:
                 self.queue.task_done()
 
     def _run_job(self, job: Job) -> None:
         job.status = "downloading"
+        try:
+            self.storage.store_metadata(job)
+        except Exception:
+            pass
         self._publish(job)
         if job.youtube_url:
             local_copy, title = self.downloader.download_youtube(job.youtube_url)
             job.display_name = title or job.display_name
+            job.title = title or job.title
         elif job.audio_path:
             local_copy = self.downloader.copy_local(job.audio_path)
         else:
@@ -99,6 +115,10 @@ class JobQueue:
             youtube_url=job.youtube_url,
             prefer_youtube_captions=job.prefer_youtube_captions,
         )
+        job.transcript_source = result.transcript_source
+        job.captions_attempted = result.captions_attempted
+        job.captions_status = result.captions_status
+        job.captions_detail = result.captions_detail
         stub_prefix = "it seems that the transcript you intended to provide is missing"
         is_stub = result.summary.strip().lower().startswith(stub_prefix)
 
@@ -106,10 +126,20 @@ class JobQueue:
             self.storage.delete_summary_and_transcript(job.id)
             job.status = "failed"
             job.error = "Transcript missing; summary was placeholder and has been removed."
+            try:
+                self.storage.store_metadata(job)
+            except Exception:
+                pass
             self._publish(job)
             return
 
         job.summary_path = self.storage.store_summary(job.id, result.summary)
+        if job.title:
+            self.storage.store_title(job.id, job.title)
+        try:
+            self.storage.store_metadata(job)
+        except Exception:
+            pass
         # Index summary
         try:
             self.vector_store.add_text(
@@ -141,4 +171,8 @@ class JobQueue:
             self.notifier.notify(job.requester_email, subject, body)
 
         job.status = "complete"
+        try:
+            self.storage.store_metadata(job)
+        except Exception:
+            pass
         self._publish(job)

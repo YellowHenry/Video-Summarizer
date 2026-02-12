@@ -55,14 +55,7 @@ export SMTP_PASSWORD="..."
 export SMTP_FROM="summaries@example.com"
 ```
 
-### Quick smoke test
-Run without the UI to verify the pipeline:
-```bash
-python smoke_test.py
-```
-This generates a short WAV, processes it, and reports where the summary was saved. With a key/endpoint set, it will hit your real provider; otherwise it returns the local stub.
-
 ### Notes
 - Audio prep uses `ffmpeg` when available. It shrinks/segments audio for Whisper; set `FFMPEG_PATH` if it’s not on PATH.
 - The exact audio sent to Whisper is saved alongside the stored input as `<original>.whisper_<bitrate>k.m4a` (or `.whisper.wav` fallback).
-- The YouTube downloader pulls audio-only (`yt-dlp`) to minimize size.***
+- The YouTube downloader pulls audio-only (`yt-dlp`) to minimize size.

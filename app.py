@@ -14,6 +14,7 @@ from backend.storage import Storage
 from backend.summarizer import CloudSummarizerClient
 from backend.vector_store import VectorStore
 from backend.qa import QAService
+from backend.jobs import Job
 
 
 class AudioSummarizerApp:
@@ -22,6 +23,16 @@ class AudioSummarizerApp:
         self.root.title("Audio Summarizer")
         self.root.geometry("720x480")
         logging.basicConfig(level=logging.INFO)
+
+        # Notebook with tabs to reduce clutter
+        self.notebook = ttk.Notebook(self.root)
+        self.jobs_tab = ttk.Frame(self.notebook)
+        self.rag_tab = ttk.Frame(self.notebook)
+        self.chat_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.jobs_tab, text="Jobs")
+        self.notebook.add(self.rag_tab, text="Search (RAG)")
+        self.notebook.add(self.chat_tab, text="Job Chat")
+        self.notebook.pack(fill="both", expand=True)
 
         self.storage = Storage()
         self.summarizer = CloudSummarizerClient()
@@ -35,15 +46,17 @@ class AudioSummarizerApp:
         self.jobs: dict[str, Job] = {}
         self.job_queue.add_listener(self.event_queue.put)
 
-        self._build_form()
-        self._build_status_table()
-        self._build_summary_panel()
-        self._build_qa_panel()
+        self._build_form(self.jobs_tab)
+        self._build_status_table(self.jobs_tab)
+        self._build_summary_panel(self.jobs_tab)
+        self._build_qa_panel(self.rag_tab)
+        self._build_chat_panel(self.chat_tab)
+        self._load_existing_jobs()
 
         self.root.after(200, self._process_job_events)
 
-    def _build_form(self) -> None:
-        form = ttk.LabelFrame(self.root, text="Submit audio")
+    def _build_form(self, parent) -> None:
+        form = ttk.LabelFrame(parent, text="Submit audio")
         form.pack(fill="x", padx=10, pady=10)
 
         path_row = ttk.Frame(form)
@@ -86,8 +99,8 @@ class AudioSummarizerApp:
         button_row.pack(fill="x", padx=8, pady=4)
         ttk.Button(button_row, text="Submit", command=self._submit_job).pack(side="right")
 
-    def _build_status_table(self) -> None:
-        table_frame = ttk.LabelFrame(self.root, text="Jobs")
+    def _build_status_table(self, parent) -> None:
+        table_frame = ttk.LabelFrame(parent, text="Jobs")
         table_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         columns = ("id", "source", "status")
@@ -99,14 +112,14 @@ class AudioSummarizerApp:
         self.tree.bind("<<TreeviewSelect>>", self._handle_select)
         self.tree.bind("<Double-1>", self._handle_double_click)
 
-    def _build_summary_panel(self) -> None:
-        panel = ttk.LabelFrame(self.root, text="Summary")
+    def _build_summary_panel(self, parent) -> None:
+        panel = ttk.LabelFrame(parent, text="Summary")
         panel.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.summary_text = tk.Text(panel, height=8, wrap="word")
         self.summary_text.pack(fill="both", expand=True)
 
-    def _build_qa_panel(self) -> None:
-        panel = ttk.LabelFrame(self.root, text="Ask a question (search past transcripts)")
+    def _build_qa_panel(self, parent) -> None:
+        panel = ttk.LabelFrame(parent, text="Ask a question (search past transcripts)")
         panel.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         row = ttk.Frame(panel)
@@ -135,6 +148,23 @@ class AudioSummarizerApp:
         self.links_list.pack(fill="both", expand=True)
         self.links_list.bind("<Double-1>", self._open_link)
         self.link_paths: list[str] = []
+
+    def _build_chat_panel(self, parent) -> None:
+        self.chat_panel = ttk.LabelFrame(parent, text="Chat about a job")
+        self.chat_panel.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.chat_job_label = ttk.Label(self.chat_panel, text="No job selected")
+        self.chat_job_label.pack(anchor="w", padx=6, pady=(2, 4))
+
+        chat_row = ttk.Frame(self.chat_panel)
+        chat_row.pack(fill="x", padx=6, pady=4)
+        ttk.Label(chat_row, text="Message:").pack(side="left")
+        self.chat_var = tk.StringVar()
+        ttk.Entry(chat_row, textvariable=self.chat_var, width=50).pack(side="left", padx=4, fill="x", expand=True)
+        ttk.Button(chat_row, text="Send", command=self._send_chat).pack(side="left")
+
+        self.chat_history = tk.Text(self.chat_panel, height=12, wrap="word")
+        self.chat_history.pack(fill="both", expand=True, padx=6, pady=4)
 
     def _choose_file(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -170,10 +200,17 @@ class AudioSummarizerApp:
         self._clear_form()
 
     def _add_or_update_row(self, job: Job) -> None:
-        if job.id not in self.tree.get_children(""):
+        # maintain sort by created_at descending
+        existing_ids = list(self.tree.get_children(""))
+        if job.id not in existing_ids:
             self.tree.insert("", "end", iid=job.id, values=(job.display_id(), job.describe(), job.status))
         else:
             self.tree.item(job.id, values=(job.display_id(), job.describe(), job.status))
+        # reorder
+        jobs_sorted = sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)
+        for idx, j in enumerate(jobs_sorted):
+            if j.id in self.tree.get_children(""):
+                self.tree.move(j.id, "", idx)
 
     def _process_job_events(self) -> None:
         while not self.event_queue.empty():
@@ -194,6 +231,7 @@ class AudioSummarizerApp:
         job = self.jobs.get(job_id)
         if job and job.summary_path:
             self._display_summary(job)
+            self._display_chat(job)
 
     def _handle_double_click(self, _event: tk.Event) -> None:
         selection = self.tree.selection()
@@ -204,8 +242,16 @@ class AudioSummarizerApp:
         if not job:
             return
         info_lines = [f"Job ID: {job.id}"]
+        if job.transcript_source:
+            info_lines.append(f"Transcript source: {job.transcript_source}")
+        if getattr(job, "captions_status", None):
+            info_lines.append(f"Captions status: {job.captions_status}")
+        if getattr(job, "captions_detail", None):
+            info_lines.append(f"Captions detail: {job.captions_detail}")
         if job.summary_path:
             info_lines.append(f"Summary path: {job.summary_path}")
+        if job.transcript_path:
+            info_lines.append(f"Transcript path: {job.transcript_path}")
         messagebox.showinfo("Job details", "\n".join(info_lines))
 
     def _display_summary(self, job: Job) -> None:
@@ -235,6 +281,39 @@ class AudioSummarizerApp:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Q&A failed", str(exc))
 
+    def _send_chat(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showerror("No job selected", "Select a job row first.")
+            return
+        job_id = selection[0]
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        message = self.chat_var.get().strip()
+        if not message:
+            return
+        # append user message
+        self.storage.append_chat(job.id, "user", message)
+        job.chat = self.storage.load_chat(job.id)
+        # answer using job-scoped retrieval
+        try:
+            result = self.qa_service.answer(message, youtube_url=job.youtube_url, job_id=job.id)
+            self.storage.append_chat(job.id, "assistant", result.answer)
+            job.chat = self.storage.load_chat(job.id)
+            self._display_chat(job)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Chat failed", str(exc))
+        self.chat_var.set("")
+
+    def _display_chat(self, job: Job) -> None:
+        chat_history = self.storage.load_chat(job.id)
+        label = job.display_name or job.title or job.id
+        self.chat_job_label.config(text=f"Chat for: {label}")
+        self.chat_history.delete("1.0", tk.END)
+        for msg in chat_history:
+            self.chat_history.insert(tk.END, f"{msg.get('role','?')}: {msg.get('content','')}\n")
+
     def _open_link(self, _event: tk.Event) -> None:
         selection = self.links_list.curselection()
         if not selection:
@@ -253,6 +332,29 @@ class AudioSummarizerApp:
     def _clear_form(self) -> None:
         self.audio_path_var.set("")
         self.youtube_var.set("")
+
+    def _load_existing_jobs(self) -> None:
+        for job_id, summary_path, transcript_path, title, youtube_url, created_at, status, transcript_source, prefer_youtube_captions, captions_attempted, captions_status, captions_detail in self.storage.load_existing_jobs():
+            job = Job(
+                id=job_id,
+                audio_path=None,
+                youtube_url=youtube_url,
+                requester_email=None,
+                compression=CompressionConfig(),
+                prefer_youtube_captions=prefer_youtube_captions if prefer_youtube_captions is not None else True,
+                status=status or "complete",
+                created_at=created_at,
+                summary_path=summary_path,
+                transcript_path=transcript_path if transcript_path and transcript_path.exists() else None,
+                transcript_source=transcript_source,
+                captions_attempted=captions_attempted,
+                captions_status=captions_status,
+                captions_detail=captions_detail,
+                title=title,
+                display_name=title,
+            )
+            self.jobs[job.id] = job
+            self._add_or_update_row(job)
 
 
 def main() -> None:

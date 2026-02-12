@@ -47,6 +47,9 @@ class SummarizeResult:
     summary: str
     transcript: Optional[str] = None
     transcript_source: Optional[str] = None
+    captions_attempted: bool = False
+    captions_status: Optional[str] = None
+    captions_detail: Optional[str] = None
 
 
 class CloudSummarizerClient:
@@ -71,20 +74,40 @@ class CloudSummarizerClient:
         cloud_configured = bool(self.config.api_key or self.config.endpoint)
         transcript: Optional[str] = None
         transcript_source: Optional[str] = None
+        captions_attempted = False
+        captions_status: Optional[str] = None
+        captions_detail: Optional[str] = None
 
         # Try YouTube captions first if requested and OpenAI client is available
         if prefer_youtube_captions and youtube_url and self.client:
-            captions = self._fetch_youtube_captions(youtube_url)
+            captions_attempted = True
+            captions, captions_source, captions_status, captions_detail = self._fetch_youtube_captions(youtube_url)
             if captions:
                 transcript = captions
-                transcript_source = "youtube_captions"
+                transcript_source = captions_source or "youtube_captions"
                 try:
                     summary = self._summarize_with_openai(captions)
-                    return SummarizeResult(summary=summary, transcript=transcript, transcript_source=transcript_source)
+                    return SummarizeResult(
+                        summary=summary,
+                        transcript=transcript,
+                        transcript_source=transcript_source,
+                        captions_attempted=captions_attempted,
+                        captions_status=captions_status,
+                        captions_detail=captions_detail,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self.logger.error("Summarization from YouTube captions failed: %s", exc)
                     if cloud_configured:
                         raise
+            else:
+                self.logger.info(
+                    "YouTube captions unavailable; falling back to Whisper. status=%s detail=%s",
+                    captions_status or "unknown",
+                    captions_detail or "",
+                )
+        elif prefer_youtube_captions and youtube_url and not self.client:
+            captions_status = "skipped_openai_not_configured"
+            captions_detail = "OpenAI client not configured; caption-first mode requires OpenAI to summarize captions."
 
         # HTTP endpoint takes precedence when explicitly configured
         if self.config.endpoint:
@@ -94,7 +117,14 @@ class CloudSummarizerClient:
                 )
             try:
                 summary = self.summarize_via_http(audio)
-                return SummarizeResult(summary=summary, transcript=transcript, transcript_source=transcript_source)
+                return SummarizeResult(
+                    summary=summary,
+                    transcript=transcript,
+                    transcript_source=transcript_source,
+                    captions_attempted=captions_attempted,
+                    captions_status=captions_status,
+                    captions_detail=captions_detail,
+                )
             except Exception as exc:  # noqa: BLE001
                 self.logger.error("HTTP summarization failed: %s", exc)
                 if not self.client:
@@ -109,7 +139,14 @@ class CloudSummarizerClient:
                 transcript_source = "whisper"
                 if transcript:
                     summary = self._summarize_with_openai(transcript)
-                    return SummarizeResult(summary=summary, transcript=transcript, transcript_source=transcript_source)
+                    return SummarizeResult(
+                        summary=summary,
+                        transcript=transcript,
+                        transcript_source=transcript_source,
+                        captions_attempted=captions_attempted,
+                        captions_status=captions_status,
+                        captions_detail=captions_detail,
+                    )
             except Exception as exc:  # noqa: BLE001
                 self.logger.error("OpenAI summarization failed: %s", exc)
                 if cloud_configured:
@@ -125,7 +162,14 @@ class CloudSummarizerClient:
             "summaries, or provide SUMMARIZER_HTTP_ENDPOINT for a custom "
             "compatible API."
         )
-        return SummarizeResult(summary=placeholder, transcript=transcript, transcript_source=transcript_source)
+        return SummarizeResult(
+            summary=placeholder,
+            transcript=transcript,
+            transcript_source=transcript_source,
+            captions_attempted=captions_attempted,
+            captions_status=captions_status,
+            captions_detail=captions_detail,
+        )
 
     def _resolve_ffmpeg(self) -> Optional[str]:
         import shutil
@@ -402,16 +446,18 @@ class CloudSummarizerClient:
             )
         return choice.message.content.strip()
 
-    def _fetch_youtube_captions(self, url: str) -> Optional[str]:
-        """Attempt to fetch English auto-generated YouTube captions."""
+    def _fetch_youtube_captions(self, url: str) -> tuple[Optional[str], Optional[str], str, Optional[str]]:
+        """
+        Attempt to fetch English YouTube captions and return:
+        (text, transcript_source, status, detail)
+        where transcript_source is one of "youtube_subtitles" or "youtube_auto_captions" on success.
+        """
         try:
             import yt_dlp
         except ImportError:
-            self.logger.info("yt-dlp not installed; cannot fetch YouTube captions")
-            return None
+            return (None, None, "yt_dlp_missing", "yt-dlp not installed")
         if not requests:
-            self.logger.info("requests not installed; cannot fetch YouTube captions")
-            return None
+            return (None, None, "requests_missing", "requests not installed")
 
         extractor_args_list = [
             os.getenv("YTDLP_EXTRACTOR_ARGS", "youtube:player_client=tvhtml5desktop"),
@@ -425,6 +471,7 @@ class CloudSummarizerClient:
 
         try:
             info = None
+            last_inner_error: Optional[str] = None
             for extractor_arg in extractor_args_list:
                 for profile in profiles:
                     ydl_opts = dict(ydl_opts_base)
@@ -436,15 +483,15 @@ class CloudSummarizerClient:
                         ydl_opts["cookiefile"] = os.getenv("YTDLP_COOKIES")
                         ydl_opts.pop("cookiesfrombrowser", None)
                     else:
-                        raise RuntimeError("Cookies are required to fetch captions; set YTDLP_COOKIES_FROM_BROWSER or YTDLP_COOKIES.")
+                        return (None, None, "cookies_missing", "cookies required for caption fetch (set YTDLP_COOKIES_FROM_BROWSER)")
                     try:
                         self.logger.info("yt-dlp captions extractor=%s profile=%s", extractor_arg, profile)
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
                         if info:
-                            raise_stop = True
                             break
                     except Exception as inner_exc:  # noqa: BLE001
+                        last_inner_error = str(inner_exc)
                         self.logger.debug(
                             "Caption fetch failed extractor=%s profile=%s error=%s",
                             extractor_arg,
@@ -456,48 +503,58 @@ class CloudSummarizerClient:
                     continue
                 break
             if not info:
-                return None
+                return (None, None, "extract_info_failed", last_inner_error)
         except Exception as exc:  # noqa: BLE001
-            self.logger.info("Failed to extract YouTube info for captions: %s", exc)
-            return None
+            return (None, None, "extract_info_failed", str(exc))
 
-        captions = (info or {}).get("automatic_captions") or {}
-        candidates = []
-        for lang in ("en", "en-US", "en-GB"):
-            if lang in captions:
-                candidates.extend(captions[lang])
-        for entry in candidates:
-            caption_url = entry.get("url")
-            if not caption_url:
+        subtitles = (info or {}).get("subtitles") or {}
+        auto_captions = (info or {}).get("automatic_captions") or {}
+        # Try human-provided subtitles first, then auto-generated captions.
+        for source_name, captions_map in (("youtube_subtitles", subtitles), ("youtube_auto_captions", auto_captions)):
+            candidates = []
+            for lang in ("en", "en-US", "en-GB"):
+                if lang in captions_map:
+                    candidates.extend(captions_map[lang])
+            if not candidates:
                 continue
-            try:
-                resp = requests.get(caption_url, timeout=self.config.timeout)
-                resp.raise_for_status()
-                text_content = resp.text
-                # Some caption endpoints return an HLS playlist (.m3u8) pointing to VTT chunks; follow it.
-                if text_content.lstrip().startswith("#EXTM3U"):
-                    parts: list[str] = []
-                    for line in text_content.splitlines():
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        try:
-                            seg_resp = requests.get(line, timeout=self.config.timeout)
-                            seg_resp.raise_for_status()
-                            parts.append(seg_resp.text)
-                        except Exception as seg_exc:  # noqa: BLE001
-                            self.logger.info("Failed to fetch caption segment %s: %s", line, seg_exc)
-                            continue
-                    if parts:
-                        text_content = "\n".join(parts)
-                text = self._parse_caption_payload(text_content)
-                if text:
-                    self.logger.info("Using YouTube auto captions for %s", url)
-                    return text
-            except Exception as exc:  # noqa: BLE001
-                self.logger.info("Failed to fetch/parse YouTube captions: %s", exc)
-                continue
-        return None
+            last_fetch_error: Optional[str] = None
+            for entry in candidates:
+                caption_url = entry.get("url")
+                if not caption_url:
+                    continue
+                try:
+                    resp = requests.get(caption_url, timeout=self.config.timeout)
+                    resp.raise_for_status()
+                    text_content = resp.text
+                    # Some caption endpoints return an HLS playlist (.m3u8) pointing to VTT chunks; follow it.
+                    if text_content.lstrip().startswith("#EXTM3U"):
+                        parts: list[str] = []
+                        for line in text_content.splitlines():
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            try:
+                                seg_resp = requests.get(line, timeout=self.config.timeout)
+                                seg_resp.raise_for_status()
+                                parts.append(seg_resp.text)
+                            except Exception as seg_exc:  # noqa: BLE001
+                                last_fetch_error = str(seg_exc)
+                                self.logger.info("Failed to fetch caption segment %s: %s", line, seg_exc)
+                                continue
+                        if parts:
+                            text_content = "\n".join(parts)
+                    text = self._parse_caption_payload(text_content)
+                    if text:
+                        self.logger.info("Using YouTube captions source=%s for %s", source_name, url)
+                        return (text, source_name, "success", None)
+                    last_fetch_error = "parsed captions were empty"
+                except Exception as exc:  # noqa: BLE001
+                    last_fetch_error = str(exc)
+                    self.logger.info("Failed to fetch/parse YouTube captions: %s", exc)
+                    continue
+            return (None, None, "fetch_parse_failed", last_fetch_error)
+
+        return (None, None, "no_en_captions", "No English captions found in subtitles/automatic_captions")
 
     def _parse_caption_payload(self, caption_text: str) -> str:
         """Parse YouTube captions returned as either VTT or JSON3 into human-readable text."""

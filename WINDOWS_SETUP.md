@@ -31,9 +31,3 @@ This app ingests audio (local files or YouTube URLs) and can accept local video 
 - **yt-dlp errors**: ensure `yt-dlp` is installed (`pip install -U yt-dlp`) and, for some YouTube formats, install Node.js to satisfy extractor requirements.
 - **Whisper timeouts/limits**: long audio is auto-segmented (~42 min chunks) and bitrate-reduced to stay under the 25 MB Whisper cap. Increase `SUMMARIZER_TIMEOUT` if needed.
 - **Email not sent**: set `SMTP_HOST` and `SMTP_FROM` (and auth if required) to enable notifications.
-
-## Quick test without UI
-```powershell
-python smoke_test.py
-```
-This creates a short WAV, runs it through the pipeline, and prints where the summary was stored.***
