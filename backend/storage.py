@@ -112,7 +112,7 @@ class Storage:
         """
         Return list of (job_id, summary_path, transcript_path, title, youtube_url, created_at, status,
         transcript_source, prefer_youtube_captions, captions_attempted, captions_status, captions_detail)
-        for jobs with summaries.
+        for jobs that have a summary or persisted chat history.
         """
         jobs = []
         for job_dir in self.config.base_dir.iterdir() if self.config.base_dir.exists() else []:
@@ -120,6 +120,7 @@ class Storage:
                 continue
             summary_path = job_dir / "summary.txt"
             transcript_path = job_dir / "transcript.txt"
+            chat_path = job_dir / "chat.json"
             title_path = job_dir / "title.txt"
             meta_path = job_dir / "meta.json"
             title = title_path.read_text(encoding="utf-8") if title_path.exists() else None
@@ -166,7 +167,7 @@ class Storage:
                     created_at = job_dir.stat().st_mtime
                 except Exception:
                     created_at = 0.0
-            if summary_path.exists():
+            if summary_path.exists() or chat_path.exists():
                 # Opportunistically write meta.json if missing or missing key fields.
                 needs_meta_write = (not meta_path.exists()) or (
                     not {

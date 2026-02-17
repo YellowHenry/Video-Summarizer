@@ -229,8 +229,9 @@ class AudioSummarizerApp:
             return
         job_id = selection[0]
         job = self.jobs.get(job_id)
-        if job and job.summary_path:
-            self._display_summary(job)
+        if job:
+            if job.summary_path:
+                self._display_summary(job)
             self._display_chat(job)
 
     def _handle_double_click(self, _event: tk.Event) -> None:
@@ -293,12 +294,30 @@ class AudioSummarizerApp:
         message = self.chat_var.get().strip()
         if not message:
             return
-        # append user message
+
+        transcript_path = job.transcript_path
+        if not transcript_path or not transcript_path.exists():
+            fallback = self.storage.config.base_dir / job.id / "transcript.txt"
+            transcript_path = fallback if fallback.exists() else None
+        if not transcript_path:
+            messagebox.showerror("Chat unavailable", "This job has no transcript.txt yet, so full-context chat is unavailable.")
+            return
+
+        history_before = self.storage.load_chat(job.id)
         self.storage.append_chat(job.id, "user", message)
         job.chat = self.storage.load_chat(job.id)
-        # answer using job-scoped retrieval
+
         try:
-            result = self.qa_service.answer(message, youtube_url=job.youtube_url, job_id=job.id)
+            transcript_text = transcript_path.read_text(encoding="utf-8")
+            summary_text = None
+            if job.summary_path and job.summary_path.exists():
+                summary_text = job.summary_path.read_text(encoding="utf-8")
+            result = self.qa_service.answer_job_chat(
+                message,
+                transcript_text=transcript_text,
+                conversation_history=history_before,
+                summary_text=summary_text,
+            )
             self.storage.append_chat(job.id, "assistant", result.answer)
             job.chat = self.storage.load_chat(job.id)
             self._display_chat(job)
@@ -353,6 +372,7 @@ class AudioSummarizerApp:
                 title=title,
                 display_name=title,
             )
+            job.chat = self.storage.load_chat(job_id)
             self.jobs[job.id] = job
             self._add_or_update_row(job)
 
