@@ -1,0 +1,37 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+
+# Local runtime/test artifacts (very large in this repo)
+storage/
+*.sqlite
+*.sqlite3
+
+# Frontend local artifacts (web image uses its own context/dockerignore)
+node_modules/
+web/node_modules/
+web/dist/
+
+# Dev/test-only files not needed in runtime images
+tests/
+infra/
+demo_script.md
+ps_run_command.txt
+run_command.txt
+command.txt
+WINDOWS_SETUP.md

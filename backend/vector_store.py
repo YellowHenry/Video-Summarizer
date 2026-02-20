@@ -1,12 +1,11 @@
 import json
 import math
-import os
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Set, Tuple
 
-from .config import HARDCODED_API_KEY
+from .config import get_openai_api_key
 
 try:
     from openai import OpenAI
@@ -32,9 +31,10 @@ class VectorStore:
         self.index_path = self.base_dir / "index.json"
         self.records: List[VectorRecord] = []
         self._load()
+        api_key = get_openai_api_key()
         self.client = (
-            OpenAI(api_key=os.getenv("OPENAI_API_KEY") or HARDCODED_API_KEY)
-            if OpenAI and (os.getenv("OPENAI_API_KEY") or HARDCODED_API_KEY)
+            OpenAI(api_key=api_key)
+            if OpenAI and api_key
             else None
         )
         self.logger = logging.getLogger(__name__)
@@ -109,13 +109,22 @@ class VectorStore:
         self._save()
         self.logger.info("Indexed %s chunks for job %s kind=%s", len(chunks), job_id, kind)
 
-    def query(self, query_text: str, top_k: int = 5, job_id: Optional[str] = None, source_url: Optional[str] = None) -> List[VectorRecord]:
+    def query(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        job_id: Optional[str] = None,
+        source_url: Optional[str] = None,
+        job_ids: Optional[Set[str]] = None,
+    ) -> List[VectorRecord]:
         if not self.records:
             return []
         query_vec = self._embed([query_text])[0]
         scored: List[Tuple[float, VectorRecord]] = []
         for record in self.records:
             if job_id and record.job_id != job_id:
+                continue
+            if job_ids is not None and record.job_id not in job_ids:
                 continue
             if source_url and record.source_url != source_url:
                 continue
@@ -124,6 +133,16 @@ class VectorStore:
         scored.sort(key=lambda x: x[0], reverse=True)
         self.logger.info("Query '%s' returning %s of %s candidates", query_text, min(top_k, len(scored)), len(scored))
         return [rec for _, rec in scored[:top_k]]
+
+    def remove_job_records(self, job_id: str) -> int:
+        """Remove all indexed chunks for a specific job id."""
+        before = len(self.records)
+        self.records = [record for record in self.records if record.job_id != job_id]
+        removed = before - len(self.records)
+        if removed:
+            self._save()
+            self.logger.info("Removed %s vector chunks for job %s", removed, job_id)
+        return removed
 
     @staticmethod
     def _cosine_similarity(a: List[float], b: List[float]) -> float:

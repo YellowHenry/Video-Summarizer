@@ -4,15 +4,17 @@ import os
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from .config import (
-    HARDCODED_API_KEY,
+    get_openai_api_key,
     HARDCODED_COOKIES_FROM_BROWSER,
     HARDCODED_COOKIES_BROWSER_PROFILE,
 )
+from .ytdlp_cookies import resolve_cookies_file
 
 try:
     import requests
@@ -25,9 +27,41 @@ except ImportError:  # pragma: no cover - optional dependency
     OpenAI = None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Match desktop-style authenticated YouTube access by default.
+STRICT_COOKIES = _env_bool("YTDLP_STRICT_COOKIES", True)
+# Optional non-yt-dlp fallback for operators who explicitly want it.
+TRANSCRIPT_API_FALLBACK = _env_bool("YOUTUBE_TRANSCRIPT_API_FALLBACK", False)
+PATH_FALLBACK = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _parse_csv_env(name: str, default: str) -> list[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+JS_RUNTIMES = _parse_csv_env("YTDLP_JS_RUNTIMES", "node")
+REMOTE_COMPONENTS = _parse_csv_env("YTDLP_REMOTE_COMPONENTS", "")
+
+
+def _js_runtime_dict() -> dict[str, dict]:
+    return {runtime: {} for runtime in JS_RUNTIMES}
+
+
+def _ensure_runtime_path() -> None:
+    if not (os.getenv("PATH") or "").strip():
+        os.environ["PATH"] = PATH_FALLBACK
+
+
 @dataclass
 class SummarizerConfig:
-    api_key: Optional[str] = HARDCODED_API_KEY or os.getenv("OPENAI_API_KEY") or os.getenv("SUMMARIZER_API_KEY")
+    api_key: Optional[str] = field(default_factory=get_openai_api_key)
     model: str = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")
     transcription_model: str = os.getenv("SUMMARIZER_TRANSCRIBE_MODEL", "whisper-1")
     base_url: Optional[str] = os.getenv("OPENAI_BASE_URL") or os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -67,6 +101,105 @@ class CloudSummarizerClient:
             else None
         )
         self.logger = logging.getLogger(__name__)
+
+    def summarize_youtube_captions_only(self, youtube_url: str) -> SummarizeResult:
+        """
+        Caption-first summarization path for YouTube URLs that avoids audio download.
+        This is useful in hosted workers where yt-dlp media download may require cookies.
+        """
+        if not youtube_url:
+            raise RuntimeError("youtube_url is required for caption-first summarization")
+        if not self.client:
+            raise RuntimeError("OpenAI client not configured for caption-first summarization")
+
+        captions, captions_source, captions_status, captions_detail = self._fetch_youtube_captions(youtube_url)
+        if not captions:
+            raise RuntimeError(
+                "YouTube captions unavailable "
+                f"(status={captions_status or 'unknown'}, detail={captions_detail or 'none'})"
+            )
+
+        summary = self._summarize_with_openai(captions)
+        return SummarizeResult(
+            summary=summary,
+            transcript=captions,
+            transcript_source=captions_source or "youtube_captions",
+            captions_attempted=True,
+            captions_status=captions_status,
+            captions_detail=captions_detail,
+        )
+
+    def _resolve_caption_cookie_source(self) -> Optional[str]:
+        """
+        Resolve browser-cookie source for yt-dlp caption extraction.
+        In Cloud Run, default to no browser cookies unless explicitly configured.
+        """
+        from_env = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+        if from_env is not None:
+            cleaned = from_env.strip()
+            return cleaned or None
+        if os.getenv("K_SERVICE"):
+            return None
+        return HARDCODED_COOKIES_FROM_BROWSER
+
+    def _extract_youtube_video_id(self, url: str) -> Optional[str]:
+        try:
+            parsed = urlparse(url)
+        except Exception:  # noqa: BLE001
+            return None
+
+        host = (parsed.netloc or "").lower()
+        if "youtu.be" in host:
+            candidate = parsed.path.strip("/")
+            return candidate or None
+
+        if "youtube.com" in host or "music.youtube.com" in host:
+            query = parse_qs(parsed.query)
+            candidate = (query.get("v") or [None])[0]
+            if candidate:
+                return candidate
+            # /shorts/<id> or /embed/<id>
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) >= 2 and parts[0] in {"shorts", "embed"}:
+                return parts[1]
+        return None
+
+    def _fetch_youtube_captions_via_transcript_api(
+        self, url: str
+    ) -> tuple[Optional[str], Optional[str], str, Optional[str]]:
+        """
+        Optional caption fallback using youtube-transcript-api.
+        """
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+        except Exception:
+            return (None, None, "transcript_api_missing", "youtube-transcript-api not installed")
+
+        video_id = self._extract_youtube_video_id(url)
+        if not video_id:
+            return (None, None, "invalid_youtube_url", "Could not parse YouTube video id from URL")
+
+        try:
+            transcript = YouTubeTranscriptApi().fetch(video_id, languages=["en", "en-US", "en-GB"])
+        except Exception as exc:  # noqa: BLE001
+            return (None, None, "transcript_api_failed", str(exc))
+
+        lines: list[str] = []
+        for item in transcript:
+            text = None
+            if hasattr(item, "text"):
+                text = getattr(item, "text", None)
+            elif isinstance(item, dict):
+                text = item.get("text")
+            if not text:
+                continue
+            cleaned = str(text).replace("\u00a0", " ").replace("\n", " ").strip()
+            if cleaned:
+                lines.append(cleaned)
+        parsed = "\n".join(lines).strip()
+        if not parsed:
+            return (None, None, "transcript_api_empty", "Transcript API returned empty text")
+        return (parsed, "youtube_captions", "success", None)
 
     def summarize(self, audio: Path, youtube_url: Optional[str] = None, prefer_youtube_captions: bool = True) -> SummarizeResult:
         """Summarize an audio file using configured cloud providers and return both the summary and raw transcript when available."""
@@ -158,7 +291,8 @@ class CloudSummarizerClient:
         time.sleep(1)
         placeholder = (
             "Concise, conceptually faithful summary generated locally. Set "
-            "OPENAI_API_KEY (or SUMMARIZER_API_KEY) to enable live Whisper + GPT "
+            "backend/config.py OPENAI_API_KEY (or env OPENAI_API_KEY/SUMMARIZER_API_KEY) "
+            "to enable live Whisper + GPT "
             "summaries, or provide SUMMARIZER_HTTP_ENDPOINT for a custom "
             "compatible API."
         )
@@ -314,7 +448,23 @@ class CloudSummarizerClient:
     def _candidate_profiles(self) -> list[str]:
         """Return a single best Chrome profile to try."""
         preferred = os.getenv("YTDLP_COOKIES_FROM_BROWSER_PROFILE") or HARDCODED_COOKIES_BROWSER_PROFILE or "Default"
-        chrome_dir = Path(os.getenv("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+
+        local_app_data = (os.getenv("LOCALAPPDATA") or "").strip()
+        if local_app_data:
+            chrome_dir = Path(local_app_data) / "Google" / "Chrome" / "User Data"
+        else:
+            home = Path.home()
+            candidates = [
+                home / ".config" / "google-chrome",
+                home / ".var" / "app" / "com.google.Chrome" / "config" / "google-chrome",
+                home / ".config" / "chromium",
+            ]
+            chrome_dir = candidates[0]
+            for candidate in candidates:
+                if candidate.exists():
+                    chrome_dir = candidate
+                    break
+
         existing: list[str] = []
         if chrome_dir.exists():
             for path in chrome_dir.iterdir():
@@ -452,9 +602,29 @@ class CloudSummarizerClient:
         (text, transcript_source, status, detail)
         where transcript_source is one of "youtube_subtitles" or "youtube_auto_captions" on success.
         """
+        transcript_api_result: Optional[tuple[Optional[str], Optional[str], str, Optional[str]]] = None
+
+        def _maybe_try_transcript_api() -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+            nonlocal transcript_api_result
+            if not TRANSCRIPT_API_FALLBACK:
+                return (None, None, None, None)
+            if transcript_api_result is None:
+                transcript_api_result = self._fetch_youtube_captions_via_transcript_api(url)
+            text, source, status, detail = transcript_api_result
+            if text:
+                self.logger.info("Using transcript-api fallback captions for %s", url)
+            return (text, source, status, detail)
+
+        _ensure_runtime_path()
+
         try:
             import yt_dlp
         except ImportError:
+            text, source, status, detail = _maybe_try_transcript_api()
+            if text:
+                return (text, source, status or "success", detail)
+            if status and detail:
+                return (None, None, "yt_dlp_missing", f"yt-dlp not installed; transcript_api={status}: {detail}")
             return (None, None, "yt_dlp_missing", "yt-dlp not installed")
         if not requests:
             return (None, None, "requests_missing", "requests not installed")
@@ -466,26 +636,64 @@ class CloudSummarizerClient:
             "youtube:player_client=default",
         ]
         ydl_opts_base = {"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": False}
-        browser_cookie = os.getenv("YTDLP_COOKIES_FROM_BROWSER") or HARDCODED_COOKIES_FROM_BROWSER
-        profiles = self._candidate_profiles()
+        browser_cookie = self._resolve_caption_cookie_source()
+        cookie_file = resolve_cookies_file()
+        cookie_attempts: list[tuple[str, Optional[str]]] = []
+        if browser_cookie:
+            for profile in self._candidate_profiles():
+                cookie_attempts.append(("browser", profile))
+        if cookie_file:
+            cookie_attempts.append(("file", cookie_file))
+        if not cookie_attempts and STRICT_COOKIES:
+            text, source, status, detail = _maybe_try_transcript_api()
+            if text:
+                return (text, source, status or "success", detail)
+            if status and detail:
+                return (
+                    None,
+                    None,
+                    "cookie_auth_required",
+                    "YTDLP_STRICT_COOKIES=true and no cookies were configured; "
+                    f"transcript_api={status}: {detail}",
+                )
+            return (
+                None,
+                None,
+                "cookie_auth_required",
+                "YTDLP_STRICT_COOKIES=true and no cookies were configured. "
+                "Set YTDLP_COOKIES_FILE/YTDLP_COOKIES_B64/YTDLP_COOKIES, or disable strict mode explicitly.",
+            )
+        if not STRICT_COOKIES:
+            cookie_attempts.append(("none", None))
 
         try:
             info = None
             last_inner_error: Optional[str] = None
             for extractor_arg in extractor_args_list:
-                for profile in profiles:
+                for cookie_mode, cookie_value in cookie_attempts:
                     ydl_opts = dict(ydl_opts_base)
                     ydl_opts["extractor_args"] = {"youtube": [extractor_arg]}
-                    if browser_cookie:
-                        ydl_opts["cookiesfrombrowser"] = (browser_cookie, profile, None, None)
+                    if JS_RUNTIMES:
+                        ydl_opts["js_runtimes"] = _js_runtime_dict()
+                    if REMOTE_COMPONENTS:
+                        ydl_opts["remote_components"] = REMOTE_COMPONENTS
+                    if cookie_mode == "browser" and browser_cookie and cookie_value:
+                        ydl_opts["cookiesfrombrowser"] = (browser_cookie, cookie_value, None, None)
                         ydl_opts.pop("cookiefile", None)
-                    elif os.getenv("YTDLP_COOKIES"):
-                        ydl_opts["cookiefile"] = os.getenv("YTDLP_COOKIES")
+                    elif cookie_mode == "file" and cookie_value:
+                        ydl_opts["cookiefile"] = cookie_value
                         ydl_opts.pop("cookiesfrombrowser", None)
                     else:
-                        return (None, None, "cookies_missing", "cookies required for caption fetch (set YTDLP_COOKIES_FROM_BROWSER)")
+                        ydl_opts.pop("cookiesfrombrowser", None)
+                        ydl_opts.pop("cookiefile", None)
                     try:
-                        self.logger.info("yt-dlp captions extractor=%s profile=%s", extractor_arg, profile)
+                        if cookie_mode == "browser":
+                            cookie_label = f"browser:{browser_cookie} profile:{cookie_value}"
+                        elif cookie_mode == "file":
+                            cookie_label = f"file:{cookie_value}"
+                        else:
+                            cookie_label = "none"
+                        self.logger.info("yt-dlp captions extractor=%s cookies=%s", extractor_arg, cookie_label)
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
                         if info:
@@ -493,9 +701,9 @@ class CloudSummarizerClient:
                     except Exception as inner_exc:  # noqa: BLE001
                         last_inner_error = str(inner_exc)
                         self.logger.debug(
-                            "Caption fetch failed extractor=%s profile=%s error=%s",
+                            "Caption fetch failed extractor=%s cookie_mode=%s error=%s",
                             extractor_arg,
-                            profile,
+                            cookie_mode,
                             inner_exc,
                         )
                         continue
@@ -503,9 +711,21 @@ class CloudSummarizerClient:
                     continue
                 break
             if not info:
-                return (None, None, "extract_info_failed", last_inner_error)
+                detail = last_inner_error
+                text, source, status, transcript_detail = _maybe_try_transcript_api()
+                if text:
+                    return (text, source, status or "success", transcript_detail)
+                if status and transcript_detail:
+                    detail = f"yt_dlp={last_inner_error}; transcript_api={status}: {transcript_detail}"
+                return (None, None, "extract_info_failed", detail)
         except Exception as exc:  # noqa: BLE001
-            return (None, None, "extract_info_failed", str(exc))
+            detail = str(exc)
+            text, source, status, transcript_detail = _maybe_try_transcript_api()
+            if text:
+                return (text, source, status or "success", transcript_detail)
+            if status and transcript_detail:
+                detail = f"yt_dlp={detail}; transcript_api={status}: {transcript_detail}"
+            return (None, None, "extract_info_failed", detail)
 
         subtitles = (info or {}).get("subtitles") or {}
         auto_captions = (info or {}).get("automatic_captions") or {}
@@ -554,7 +774,13 @@ class CloudSummarizerClient:
                     continue
             return (None, None, "fetch_parse_failed", last_fetch_error)
 
-        return (None, None, "no_en_captions", "No English captions found in subtitles/automatic_captions")
+        detail = "No English captions found in subtitles/automatic_captions"
+        text, source, status, transcript_detail = _maybe_try_transcript_api()
+        if text:
+            return (text, source, status or "success", transcript_detail)
+        if status and transcript_detail:
+            detail = f"yt_dlp={detail}; transcript_api={status}: {transcript_detail}"
+        return (None, None, "no_en_captions", detail)
 
     def _parse_caption_payload(self, caption_text: str) -> str:
         """Parse YouTube captions returned as either VTT or JSON3 into human-readable text."""

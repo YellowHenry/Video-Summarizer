@@ -1,7 +1,47 @@
+# Python caches/build artifacts
 __pycache__/
 *.pyc
 *.pyo
-*.DS_Store
-storage/
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# Virtual environments
 venv/
 .venv/
+ENV/
+
+# Frontend artifacts
+web/node_modules/
+web/dist/
+web/.vite/
+web/playwright-report/
+web/test-results/
+
+# Local runtime/output
+storage/
+*.log
+tmp/
+temp/
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
+infra/gcp/env.sh
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*.DS_Store
+Thumbs.db

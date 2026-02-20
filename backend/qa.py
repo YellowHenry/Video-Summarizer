@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Sequence
+from typing import List, Optional, Sequence, Set
 
 from .summarizer import CloudSummarizerClient, SummarizerConfig
 from .vector_store import VectorStore
@@ -19,8 +19,24 @@ class QAService:
         self.summarizer = summarizer_client or CloudSummarizerClient(SummarizerConfig())
         self.logger = logging.getLogger(__name__)
 
-    def answer(self, question: str, youtube_url: Optional[str] = None, job_id: Optional[str] = None, top_k: int = 5) -> QAResult:
-        records = self.vector_store.query(question, top_k=top_k, job_id=job_id, source_url=youtube_url)
+    def answer(
+        self,
+        question: str,
+        youtube_url: Optional[str] = None,
+        job_id: Optional[str] = None,
+        top_k: int = 5,
+        job_ids: Optional[Set[str]] = None,
+    ) -> QAResult:
+        records = self.vector_store.query(
+            question,
+            top_k=top_k,
+            job_id=job_id,
+            source_url=youtube_url,
+            job_ids=job_ids,
+        )
+        return self.answer_from_records(question, records)
+
+    def answer_from_records(self, question: str, records: Sequence["VectorRecord"]) -> QAResult:
         if not records:
             return QAResult(answer="No indexed transcripts available to answer this question.", contexts=[], hits=[])
 
@@ -36,7 +52,10 @@ class QAService:
             f"Context:\n{context_text}\n\nQuestion: {question}\nAnswer:"
         )
         if not self.summarizer.client:
-            return QAResult(answer="OpenAI client is not configured. Set OPENAI_API_KEY.", contexts=context_blocks)
+            return QAResult(
+                answer="OpenAI client is not configured. Set backend/config.py OPENAI_API_KEY or env OPENAI_API_KEY.",
+                contexts=context_blocks,
+            )
 
         completion = self.summarizer.client.chat.completions.create(
             model=self.summarizer.config.model,
@@ -45,7 +64,7 @@ class QAService:
             max_tokens=400,
         )
         answer = completion.choices[0].message.content.strip()
-        return QAResult(answer=answer, contexts=context_blocks, hits=records)
+        return QAResult(answer=answer, contexts=context_blocks, hits=list(records))
 
     def answer_job_chat(
         self,
@@ -59,7 +78,11 @@ class QAService:
         This bypasses vector retrieval by design.
         """
         if not self.summarizer.client:
-            return QAResult(answer="OpenAI client is not configured. Set OPENAI_API_KEY.", contexts=[], hits=[])
+            return QAResult(
+                answer="OpenAI client is not configured. Set backend/config.py OPENAI_API_KEY or env OPENAI_API_KEY.",
+                contexts=[],
+                hits=[],
+            )
 
         cleaned_transcript = (transcript_text or "").strip()
         if not cleaned_transcript:

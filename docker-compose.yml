@@ -1,0 +1,81 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: capstone
+      POSTGRES_USER: capstone
+      POSTGRES_PASSWORD: capstone
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql+psycopg://capstone:capstone@postgres:5432/capstone
+      REDIS_URL: redis://redis:6379/0
+      RQ_QUEUE_NAME: jobs
+      RQ_RETRY_MAX: 3
+      RQ_RETRY_INTERVALS: 30,120,300
+      OBJECT_STORAGE_BACKEND: local
+      LOCAL_OBJECT_ROOT: /app/storage/objects
+      API_BASE_URL: http://localhost:8000
+      CORS_ALLOW_ORIGINS: http://localhost:5173
+      WEBAPP_ENABLE_PGVECTOR: "false"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      YTDLP_COOKIES_FROM_BROWSER: ${YTDLP_COOKIES_FROM_BROWSER:-}
+      YTDLP_COOKIES_FROM_BROWSER_PROFILE: ${YTDLP_COOKIES_FROM_BROWSER_PROFILE:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/app/storage
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql+psycopg://capstone:capstone@postgres:5432/capstone
+      REDIS_URL: redis://redis:6379/0
+      RQ_QUEUE_NAME: jobs
+      RQ_RETRY_MAX: 3
+      RQ_RETRY_INTERVALS: 30,120,300
+      OBJECT_STORAGE_BACKEND: local
+      LOCAL_OBJECT_ROOT: /app/storage/objects
+      API_BASE_URL: http://localhost:8000
+      WEBAPP_ENABLE_PGVECTOR: "false"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      YTDLP_COOKIES_FROM_BROWSER: ${YTDLP_COOKIES_FROM_BROWSER:-}
+      YTDLP_COOKIES_FROM_BROWSER_PROFILE: ${YTDLP_COOKIES_FROM_BROWSER_PROFILE:-}
+    volumes:
+      - ./storage:/app/storage
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    depends_on:
+      - api
+    ports:
+      - "5173:80"
+
+volumes:
+  postgres_data:

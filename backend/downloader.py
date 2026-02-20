@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .config import HARDCODED_COOKIES_FROM_BROWSER, HARDCODED_COOKIES_BROWSER_PROFILE
+from .ytdlp_cookies import resolve_cookies_file
 
 AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
@@ -18,10 +19,74 @@ FALLBACK_EXTRACTOR_ARGS = [
     "youtube:player_client=web_remix",
     "youtube:player_client=default",
 ]
-COOKIES_FILE = os.getenv("YTDLP_COOKIES")  # optional path to cookies.txt (Netscape format)
-COOKIES_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER") or HARDCODED_COOKIES_FROM_BROWSER  # optional browser name for --cookies-from-browser
+PATH_FALLBACK = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Default to strict cookie-auth mode so web/worker behaves like desktop cookie usage.
+STRICT_COOKIES = _env_bool("YTDLP_STRICT_COOKIES", True)
+
+COOKIES_FILE = resolve_cookies_file()  # optional path to cookies.txt (Netscape format)
+COOKIES_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+if COOKIES_BROWSER is None:
+    # In Cloud Run there is no local desktop browser profile to read cookies from.
+    # Strict mode will require a cookies file/proxy configuration in that case.
+    COOKIES_BROWSER = None if os.getenv("K_SERVICE") else HARDCODED_COOKIES_FROM_BROWSER
 COOKIES_BROWSER_PROFILE = os.getenv("YTDLP_COOKIES_FROM_BROWSER_PROFILE") or HARDCODED_COOKIES_BROWSER_PROFILE
-CHROME_USER_DATA = Path(os.getenv("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+
+
+def _parse_csv_env(name: str, default: str) -> list[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+JS_RUNTIMES = _parse_csv_env("YTDLP_JS_RUNTIMES", "node")
+REMOTE_COMPONENTS = _parse_csv_env("YTDLP_REMOTE_COMPONENTS", "")
+
+
+def _js_runtime_dict() -> dict[str, dict]:
+    return {runtime: {} for runtime in JS_RUNTIMES}
+
+
+def _extra_cli_flags() -> list[str]:
+    flags: list[str] = []
+    for runtime in JS_RUNTIMES:
+        flags += ["--js-runtimes", runtime]
+    for component in REMOTE_COMPONENTS:
+        flags += ["--remote-components", component]
+    return flags
+
+
+def _ensure_runtime_path() -> None:
+    if not (os.getenv("PATH") or "").strip():
+        os.environ["PATH"] = PATH_FALLBACK
+
+
+def _chrome_user_data_root() -> Path:
+    """Return Chrome profile root for the current OS."""
+    local_app_data = (os.getenv("LOCALAPPDATA") or "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "Google" / "Chrome" / "User Data"
+
+    home = Path.home()
+    candidates = [
+        home / ".config" / "google-chrome",
+        home / ".var" / "app" / "com.google.Chrome" / "config" / "google-chrome",
+        home / ".config" / "chromium",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+CHROME_USER_DATA = _chrome_user_data_root()
 
 
 class AudioDownloader:
@@ -29,16 +94,52 @@ class AudioDownloader:
         self.download_root = download_root or Path(tempfile.gettempdir())
         self.logger = logging.getLogger(__name__)
 
+    def get_youtube_title(self, url: str) -> Optional[str]:
+        """
+        Best-effort title lookup without downloading media.
+        Never raises, so callers can use it opportunistically.
+        """
+        try:
+            return self._get_title(url)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("YouTube title lookup failed for %s: %s", url, exc)
+            return None
+
+    def _cookie_attempts(self) -> list[tuple[list[str], str]]:
+        """
+        Build cookie strategies to try.
+        In strict mode, only authenticated cookie attempts are allowed.
+        """
+        attempts: list[tuple[list[str], str]] = []
+        if COOKIES_BROWSER:
+            for profile in self._candidate_profiles():
+                attempts.append(
+                    (
+                        ["--cookies-from-browser", f"{COOKIES_BROWSER}:{profile}"],
+                        f"browser:{COOKIES_BROWSER} profile:{profile}",
+                    )
+                )
+        if COOKIES_FILE:
+            attempts.append((["--cookies", COOKIES_FILE], f"file:{COOKIES_FILE}"))
+        if not attempts and STRICT_COOKIES:
+            raise RuntimeError(
+                "YouTube cookie auth is required (YTDLP_STRICT_COOKIES=true), but no cookies were configured. "
+                "Set YTDLP_COOKIES_FILE/YTDLP_COOKIES_B64/YTDLP_COOKIES, or disable strict mode explicitly."
+            )
+        if not STRICT_COOKIES:
+            attempts.append(([], "none"))
+        return attempts
+
     def _get_title(self, url: str) -> Optional[str]:
         """Fetch the YouTube title without downloading media."""
+        _ensure_runtime_path()
         try:
             import yt_dlp
         except ImportError:
             return None
 
         for extractor_arg in FALLBACK_EXTRACTOR_ARGS:
-            for profile in self._candidate_profiles():
-                browser_spec = (COOKIES_BROWSER, profile, None, None) if COOKIES_BROWSER else None
+            for cookies_flags, cookies_label in self._cookie_attempts():
                 ydl_opts = {
                     "quiet": True,
                     "no_warnings": True,
@@ -46,18 +147,29 @@ class AudioDownloader:
                     "extract_flat": False,
                     "extractor_args": {"youtube": [extractor_arg]},
                 }
-                if browser_spec:
-                    ydl_opts["cookiesfrombrowser"] = browser_spec
-                elif COOKIES_FILE:
-                    ydl_opts["cookiefile"] = COOKIES_FILE
+                if JS_RUNTIMES:
+                    ydl_opts["js_runtimes"] = _js_runtime_dict()
+                if REMOTE_COMPONENTS:
+                    ydl_opts["remote_components"] = REMOTE_COMPONENTS
+                if cookies_flags and cookies_flags[0] == "--cookies-from-browser":
+                    browser_spec = cookies_flags[1]
+                    browser, profile = browser_spec.split(":", 1)
+                    ydl_opts["cookiesfrombrowser"] = (browser, profile, None, None)
+                elif cookies_flags and cookies_flags[0] == "--cookies":
+                    ydl_opts["cookiefile"] = cookies_flags[1]
                 try:
-                    self.logger.info("yt-dlp title attempt extractor=%s cookies=browser:%s profile:%s", extractor_arg, COOKIES_BROWSER, profile)
+                    self.logger.info("yt-dlp title attempt extractor=%s cookies=%s", extractor_arg, cookies_label)
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                         if info and info.get("title"):
                             return info["title"]
                 except Exception as exc:  # noqa: BLE001
-                    self.logger.debug("Title fetch failed extractor=%s profile=%s cookies=%s error=%s", extractor_arg, profile, browser_spec or COOKIES_FILE or "none", exc)
+                    self.logger.debug(
+                        "Title fetch failed extractor=%s cookies=%s error=%s",
+                        extractor_arg,
+                        cookies_label,
+                        exc,
+                    )
                     continue
         return None
 
@@ -78,6 +190,7 @@ class AudioDownloader:
         for real YouTube downloads.
         """
 
+        _ensure_runtime_path()
         title = self._get_title(url)
         sanitized = url.replace("https://", "").replace("http://", "")
         # Remove all invalid Windows filename characters: < > : " / \ | ? *
@@ -105,6 +218,7 @@ class AudioDownloader:
                 "--audio-format",
                 "m4a",
             ]
+            base_common += _extra_cli_flags()
         else:
             # Fall back to python -m yt_dlp (works with Windows Store Python)
             try:
@@ -127,25 +241,20 @@ class AudioDownloader:
                 "--audio-format",
                 "m4a",
             ]
+            base_common += _extra_cli_flags()
         attempts = []
-        profiles = self._candidate_profiles()
         for extractor_arg in FALLBACK_EXTRACTOR_ARGS:
-            for profile in profiles:
-                cookies_flags: list[str] = []
-                if COOKIES_BROWSER:
-                    cookies_flags = ["--cookies-from-browser", f"{COOKIES_BROWSER}:{profile}"]
-                elif COOKIES_FILE:
-                    cookies_flags = ["--cookies", COOKIES_FILE]
-                else:
-                    raise RuntimeError("Cookies required: set YTDLP_COOKIES_FROM_BROWSER (e.g., 'edge') or YTDLP_COOKIES to a cookies.txt file.")
-
+            for cookies_flags, cookies_label in self._cookie_attempts():
                 attempt_with = base_common + ["--extractor-args", extractor_arg] + cookies_flags + [url]
-                attempts.append((extractor_arg, profile, cookies_flags, attempt_with))
+                attempts.append((extractor_arg, cookies_label, cookies_flags, attempt_with))
         last_error: Optional[str] = None
-        for extractor_arg, profile, cookies_flags, attempt in attempts:
-            self.logger.info("yt-dlp attempt extractor=%s profile=%s cookies=%s", extractor_arg, profile, " ".join(cookies_flags))
+        for extractor_arg, cookies_label, cookies_flags, attempt in attempts:
+            self.logger.info("yt-dlp attempt extractor=%s cookies=%s", extractor_arg, cookies_label)
             try:
-                result = subprocess.run(attempt, check=True, capture_output=True, text=True)
+                run_env = os.environ.copy()
+                if not (run_env.get("PATH") or "").strip():
+                    run_env["PATH"] = PATH_FALLBACK
+                result = subprocess.run(attempt, check=True, capture_output=True, text=True, env=run_env)
                 if output_path.exists():
                     return output_path, title
                 temp_files = list(temp_dir.glob("*"))
@@ -165,6 +274,11 @@ class AudioDownloader:
         hint = ""
         if "403" in (last_error or "") or "SABR" in (last_error or ""):
             hint = " Hint: this video may require cookies/login; set YTDLP_COOKIES to a cookies.txt path or try another client."
+        if "sign in to confirm you" in (last_error or "").lower():
+            hint += (
+                " Hint: YouTube blocked this cloud request. Configure YTDLP_COOKIES "
+                "(or YTDLP_COOKIES_TEXT/YTDLP_COOKIES_B64), use a proxy, or upload the media file directly."
+            )
         if "DPAPI" in (last_error or "") or "_parse_browser_specification" in (last_error or "") or "Could not copy" in (last_error or ""):
             hint += " Hint: browser cookies could not be read; close the browser or use YTDLP_COOKIES to supply an exported cookies.txt."
         raise RuntimeError(f"yt-dlp failed to download {url}. Error: {last_error}{hint}")
