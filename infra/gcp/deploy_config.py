@@ -31,6 +31,7 @@ class DeployConfig:
     REDIS_INSTANCE: Optional[str] = "capstone-redis"
     BUCKET_NAME: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
+    OPENAI_TRUST_ENV_PROXY: str = "false"
 
     # Optional with defaults
     NETWORK: str = "default"
@@ -76,6 +77,23 @@ class DeployConfig:
     YTDLP_JS_RUNTIMES: str = "node"
     YTDLP_REMOTE_COMPONENTS: Optional[str] = None
     YOUTUBE_TRANSCRIPT_API_FALLBACK: str = "false"
+    # Proxy egress controls (VM worker)
+    PROXY_ENABLED: str = "false"
+    PROXY_CAPTIONS_ONLY: str = "false"
+    HTTP_PROXY: Optional[str] = None
+    HTTPS_PROXY: Optional[str] = None
+    ALL_PROXY: Optional[str] = None
+    NO_PROXY: str = "169.254.169.254,metadata.google.internal,localhost,127.0.0.1"
+    PROXY_ROTATION_MODE: str = "on_rate_limit"  # none|per_job|on_rate_limit
+    PROXY_MAX_RETRIES: str = "3"
+    PROXY_BACKOFF_SECONDS: str = "2"
+    PROXY_POOL: Optional[str] = None
+    # Optional proxy auto-generation from one template, e.g.:
+    # "http://user:pass@proxy{i}.provider.net:1000{i}"
+    PROXY_AUTOGENERATE: str = "false"
+    PROXY_AUTOGENERATE_TEMPLATE: Optional[str] = None
+    PROXY_AUTOGENERATE_START: str = "1"
+    PROXY_AUTOGENERATE_END: str = "1"
 
     # Optional domain mapping
     API_DOMAIN: Optional[str] = None
@@ -104,6 +122,12 @@ CONFIG = DeployConfig(
     WORKER_VM_MACHINE_TYPE="e2-medium",
     OPENAI_API_KEY=None,  # uses backend/config.py fallback
     YTDLP_COOKIES_FILE=None,
+    PROXY_ENABLED="true",
+    PROXY_CAPTIONS_ONLY="true",
+    PROXY_ROTATION_MODE="on_rate_limit",
+    PROXY_MAX_RETRIES="3",
+    PROXY_BACKOFF_SECONDS="2",
+    PROXY_POOL="http://vucelhug-rotate:8bzu3fwqvpuy@p.webshare.io:80",
 )
 
 def _fallback_openai_key() -> Optional[str]:
@@ -122,10 +146,86 @@ def _fallback_openai_key() -> Optional[str]:
         return None
 
 
+def _truthy(raw: str) -> bool:
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_int(raw: str, default: int) -> int:
+    try:
+        return int(raw.strip())
+    except Exception:
+        return default
+
+
+def _parse_csv(raw: Optional[str]) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _expand_proxy_template(template: str, start: int, end: int) -> list[str]:
+    template = template.strip()
+    if not template:
+        return []
+    if "{i" not in template and "{index" not in template and "{n" not in template:
+        return [template]
+    step = 1 if end >= start else -1
+    out: list[str] = []
+    for i in range(start, end + step, step):
+        try:
+            value = template.format(i=i, index=i, n=i).strip()
+        except Exception:
+            continue
+        if value:
+            out.append(value)
+    return out
+
+
+def _apply_proxy_env(values: dict[str, Optional[str]]) -> None:
+    proxy_enabled = _truthy(str(values.get("PROXY_ENABLED") or "false"))
+    if not proxy_enabled:
+        return
+
+    pool = _parse_csv(values.get("PROXY_POOL"))
+
+    if _truthy(str(values.get("PROXY_AUTOGENERATE") or "false")):
+        template = str(values.get("PROXY_AUTOGENERATE_TEMPLATE") or "")
+        start = _safe_int(str(values.get("PROXY_AUTOGENERATE_START") or "1"), 1)
+        end = _safe_int(str(values.get("PROXY_AUTOGENERATE_END") or str(start)), start)
+        pool.extend(_expand_proxy_template(template, start, end))
+
+    pool = _dedupe(pool)
+    if pool:
+        values["PROXY_POOL"] = ",".join(pool)
+        first = pool[0]
+        if not (values.get("HTTP_PROXY") or "").strip():
+            values["HTTP_PROXY"] = first
+        if not (values.get("HTTPS_PROXY") or "").strip():
+            values["HTTPS_PROXY"] = first
+        if not (values.get("ALL_PROXY") or "").strip():
+            values["ALL_PROXY"] = first
+
+    no_proxy = str(values.get("NO_PROXY") or "").strip()
+    if not no_proxy:
+        values["NO_PROXY"] = "169.254.169.254,metadata.google.internal,localhost,127.0.0.1"
+
+
 def get_deploy_env() -> dict[str, str]:
     values = asdict(CONFIG)
     if not values.get("OPENAI_API_KEY"):
         values["OPENAI_API_KEY"] = _fallback_openai_key()
+    _apply_proxy_env(values)
 
     out: dict[str, str] = {}
     for key, value in values.items():

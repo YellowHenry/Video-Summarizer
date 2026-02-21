@@ -1,12 +1,14 @@
 # Audio Summarizer
 
+A desktop-friendly summarization tool for YouTube videos. Users submit local audio (or video—audio is extracted) files or YouTube URLs; a background worker downloads/ingests the audio, prepares it with ffmpeg, sends it to Whisper for transcription, and summarizes the transcript with a chat model.
+
 This repo now supports both:
 - Desktop app (`Tkinter`, legacy path)
 - Web app migration (`FastAPI + React + worker queue`)
 
-The web stack keeps your existing processing modules (`downloader`, `summarizer`, `qa`, `vector_store`) and wraps them behind APIs.
+The web stack keeps the existing processing modules (`downloader`, `summarizer`, `qa`, `vector_store`) from the legacy python application and wraps them behind APIs.
 
-## Tkinter Desktop App (Legacy, Still Supported)
+## Tkinter Desktop App (Legacy)
 
 The original desktop workflow is still available.
 
@@ -226,6 +228,24 @@ Automated deployment scripts are under `infra/gcp/`:
 - `infra/gcp/run_backfill_with_cloudsql_proxy.ps1` (Windows wrapper)
 - `infra/gcp/env.example.sh` (env template)
 
+### YouTube rate-limit mitigation (Webshare + captions-only proxy mode)
+
+The web app worker can use a rotating proxy endpoint (for example Webshare) to reduce YouTube caption rate-limit failures.
+
+Current VM-worker behavior supports a split path:
+- Caption-fetch path can use proxy egress.
+- Whisper fallback path (audio download/extraction + OpenAI calls) can stay direct.
+
+Key env/config controls:
+- `PROXY_ENABLED="true"` enables proxy logic.
+- `PROXY_CAPTIONS_ONLY="true"` proxies caption requests only; keeps audio download direct.
+- `PROXY_POOL` (or `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) sets the proxy endpoint(s).
+- `PROXY_MAX_RETRIES`, `PROXY_ROTATION_MODE`, `PROXY_BACKOFF_SECONDS` control retry/rotation.
+- `OPENAI_TRUST_ENV_PROXY="false"` keeps OpenAI traffic off proxy.
+
+Example rotating endpoint:
+- `PROXY_POOL="http://<username>:<password>@p.webshare.io:80"`
+
 See `infra/gcp/README.md` for required env vars, VPC connector setup, service-account IAM, and deployment sequence.
 
 ## What Is Still Manual (By Design)
@@ -257,4 +277,3 @@ See `infra/gcp/README.md` for required env vars, VPC connector setup, service-ac
 ## Git Hygiene
 
 - This repo ignores local/runtime artifacts by default (for example: `web/node_modules`, `web/dist`, Python caches, logs, `storage/`, and local `.env` files).
-- `infra/gcp/env.sh` is intentionally ignored so machine-specific deploy values and secrets are not committed.

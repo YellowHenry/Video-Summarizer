@@ -30,6 +30,7 @@ resolve_openai_api_key
 : "${REDIS_INSTANCE:?REDIS_INSTANCE is required}"
 : "${BUCKET_NAME:?BUCKET_NAME is required}"
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is required (or set backend/config.py OPENAI_API_KEY)}"
+: "${OPENAI_TRUST_ENV_PROXY:=false}"
 : "${WORKER_VM_NAME:=audio-summarizer-worker-vm}"
 : "${WORKER_VM_ZONE:=us-central1-a}"
 : "${WORKER_VM_USER:=worker}"
@@ -45,6 +46,25 @@ resolve_openai_api_key
 : "${YTDLP_COOKIES_FROM_BROWSER_PROFILE:=Default}"
 : "${YTDLP_JS_RUNTIMES:=node}"
 : "${YTDLP_REMOTE_COMPONENTS:=}"
+: "${PROXY_ENABLED:=false}"
+: "${PROXY_CAPTIONS_ONLY:=false}"
+: "${PROXY_ROTATION_MODE:=on_rate_limit}"
+: "${PROXY_MAX_RETRIES:=3}"
+: "${PROXY_BACKOFF_SECONDS:=2}"
+: "${NO_PROXY:=169.254.169.254,metadata.google.internal,localhost,127.0.0.1}"
+: "${PROXY_POOL:=}"
+: "${PROXY_AUTOGENERATE:=false}"
+: "${PROXY_AUTOGENERATE_TEMPLATE:=}"
+: "${PROXY_AUTOGENERATE_START:=1}"
+: "${PROXY_AUTOGENERATE_END:=1}"
+
+if [[ "${PROXY_ENABLED,,}" == "true" ]]; then
+  if [[ -z "${HTTP_PROXY:-}" && -z "${HTTPS_PROXY:-}" && -z "${ALL_PROXY:-}" && -z "${PROXY_POOL:-}" && ! ( "${PROXY_AUTOGENERATE,,}" == "true" && -n "${PROXY_AUTOGENERATE_TEMPLATE:-}" ) ]]; then
+    echo "PROXY_ENABLED=true but no proxy endpoints were configured." >&2
+    echo "Set HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / PROXY_POOL, or set PROXY_AUTOGENERATE=true with PROXY_AUTOGENERATE_TEMPLATE." >&2
+    exit 1
+  fi
+fi
 
 if ! gcloud compute instances describe "${WORKER_VM_NAME}" --zone "${WORKER_VM_ZONE}" >/dev/null 2>&1; then
   echo "Worker VM '${WORKER_VM_NAME}' not found in zone '${WORKER_VM_ZONE}'." >&2
@@ -81,6 +101,7 @@ REDIS_URL=redis://${REDIS_HOST}:6379/0
 OBJECT_STORAGE_BACKEND=gcs
 GCS_BUCKET=${BUCKET_NAME}
 OPENAI_API_KEY=${OPENAI_API_KEY}
+OPENAI_TRUST_ENV_PROXY=${OPENAI_TRUST_ENV_PROXY}
 RQ_QUEUE_NAME=jobs
 RQ_RETRY_MAX=${RQ_RETRY_MAX}
 RQ_RETRY_INTERVALS=${RQ_RETRY_INTERVALS}
@@ -91,6 +112,16 @@ YTDLP_COOKIES_FROM_BROWSER=${YTDLP_COOKIES_FROM_BROWSER}
 YTDLP_COOKIES_FROM_BROWSER_PROFILE=${YTDLP_COOKIES_FROM_BROWSER_PROFILE}
 YTDLP_JS_RUNTIMES=${YTDLP_JS_RUNTIMES}
 YTDLP_REMOTE_COMPONENTS=${YTDLP_REMOTE_COMPONENTS}
+PROXY_ENABLED=${PROXY_ENABLED}
+PROXY_CAPTIONS_ONLY=${PROXY_CAPTIONS_ONLY}
+PROXY_ROTATION_MODE=${PROXY_ROTATION_MODE}
+PROXY_MAX_RETRIES=${PROXY_MAX_RETRIES}
+PROXY_BACKOFF_SECONDS=${PROXY_BACKOFF_SECONDS}
+NO_PROXY=${NO_PROXY}
+PROXY_AUTOGENERATE=${PROXY_AUTOGENERATE}
+PROXY_AUTOGENERATE_TEMPLATE=${PROXY_AUTOGENERATE_TEMPLATE}
+PROXY_AUTOGENERATE_START=${PROXY_AUTOGENERATE_START}
+PROXY_AUTOGENERATE_END=${PROXY_AUTOGENERATE_END}
 EOF
 
 if [[ -n "${YTDLP_COOKIES:-}" ]]; then
@@ -101,6 +132,20 @@ if [[ -n "${YTDLP_COOKIES_TEXT:-}" ]]; then
 fi
 if [[ -n "${YTDLP_COOKIES_B64:-}" ]]; then
   echo "YTDLP_COOKIES_B64=${YTDLP_COOKIES_B64}" >>"${ENV_FILE}"
+fi
+if [[ "${PROXY_ENABLED,,}" == "true" ]]; then
+  if [[ -n "${HTTP_PROXY:-}" ]]; then
+    echo "HTTP_PROXY=${HTTP_PROXY}" >>"${ENV_FILE}"
+  fi
+  if [[ -n "${HTTPS_PROXY:-}" ]]; then
+    echo "HTTPS_PROXY=${HTTPS_PROXY}" >>"${ENV_FILE}"
+  fi
+  if [[ -n "${ALL_PROXY:-}" ]]; then
+    echo "ALL_PROXY=${ALL_PROXY}" >>"${ENV_FILE}"
+  fi
+  if [[ -n "${PROXY_POOL:-}" ]]; then
+    echo "PROXY_POOL=${PROXY_POOL}" >>"${ENV_FILE}"
+  fi
 fi
 
 gcloud compute scp "${SRC_TAR}" "${WORKER_VM_NAME}:${REMOTE_TAR}" --zone "${WORKER_VM_ZONE}" >/dev/null

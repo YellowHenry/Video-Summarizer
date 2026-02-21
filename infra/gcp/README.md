@@ -484,10 +484,29 @@ error getting credentials - err: exec: "docker-credential-gcloud": executable fi
   - Worker uses cookie-authenticated yt-dlp extraction/downloading by default.
   - `YTDLP_STRICT_COOKIES=true` is default, so worker will not do cookieless shortcuts.
   - `YOUTUBE_TRANSCRIPT_API_FALLBACK=false` is default, so transcript-api fallback is also disabled.
+  - In `prefer_youtube_captions` mode, worker tries automatic YouTube captions first; if captions are unavailable, it normally falls back to media processing + Whisper transcription.
   - If bot-block is detected and no cookie/proxy config is present, worker fails fast with a clear remediation message.
   - If you explicitly enable fallback env vars, non-cookie fallback paths can be used.
 - Mitigations:
   - Provide cookies to worker via Chrome browser profile on the VM (recommended).
+  - Add proxy egress for worker outbound traffic when YouTube keeps rate-limiting cloud IPs.
+    - Set in `infra/gcp/deploy_config.py`:
+      - `PROXY_ENABLED="true"`
+      - `PROXY_CAPTIONS_ONLY="true"` (recommended: proxy captions path, keep Whisper/audio download direct)
+      - `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (or `PROXY_POOL`)
+      - `PROXY_ROTATION_MODE="on_rate_limit"`
+      - `PROXY_MAX_RETRIES="3"`
+      - `PROXY_BACKOFF_SECONDS="2"`
+      - `OPENAI_TRUST_ENV_PROXY="false"` (recommended so OpenAI Whisper/chat calls stay direct and only YouTube egress uses proxy pool logic)
+      - Webshare rotating endpoint example:
+        - `PROXY_POOL="http://<username>:<password>@p.webshare.io:80"`
+        - or set `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` to that same endpoint
+    - Optional auto-generation (instead of manually listing all proxies):
+      - `PROXY_AUTOGENERATE="true"`
+      - `PROXY_AUTOGENERATE_TEMPLATE="http://user:pass@proxy{i}.provider.net:80{i}"`
+      - `PROXY_AUTOGENERATE_START="1"`
+      - `PROXY_AUTOGENERATE_END="3"`
+    - Then redeploy VM worker: `bash infra/gcp/deploy_worker_vm.sh`
   - Advanced fallback options:
     - `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_B64` / `YTDLP_COOKIES`
   - Or submit local/uploaded media files instead of YouTube URLs for blocked videos.

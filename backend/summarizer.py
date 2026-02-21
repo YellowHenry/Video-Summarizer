@@ -14,6 +14,15 @@ from .config import (
     HARDCODED_COOKIES_FROM_BROWSER,
     HARDCODED_COOKIES_BROWSER_PROFILE,
 )
+from .proxy_egress import (
+    build_requests_proxies,
+    is_rate_limited_error,
+    load_proxy_egress_config,
+    proxy_index,
+    redact_proxy,
+    select_proxy_for_attempt,
+    sleep_backoff,
+)
 from .ytdlp_cookies import resolve_cookies_file
 
 try:
@@ -22,8 +31,10 @@ except ImportError:  # pragma: no cover - optional dependency
     requests = None
 
 try:
-    from openai import OpenAI
+    from openai import BadRequestError, DefaultHttpxClient, OpenAI
 except ImportError:  # pragma: no cover - optional dependency
+    BadRequestError = None
+    DefaultHttpxClient = None
     OpenAI = None
 
 
@@ -74,6 +85,7 @@ class SummarizerConfig:
     max_tokens: int = int(os.getenv("SUMMARIZER_MAX_TOKENS", "800"))
     chunk_duration_seconds: int = int(os.getenv("SUMMARIZER_CHUNK_SECONDS", str(42 * 60)))  # default 42 minutes
     whisper_upload_limit_bytes: int = int(os.getenv("SUMMARIZER_WHISPER_LIMIT_BYTES", str(25 * 1024 * 1024)))
+    openai_trust_env_proxy: bool = _env_bool("OPENAI_TRUST_ENV_PROXY", False)
 
 
 @dataclass
@@ -88,19 +100,61 @@ class SummarizeResult:
 
 class CloudSummarizerClient:
     def __init__(self, config: Optional[SummarizerConfig] = None):
-        self.config = config or SummarizerConfig()
-        self.client = (
-            OpenAI(
-                api_key=self.config.api_key,
-                base_url=self.config.base_url,
-                organization=self.config.organization,
-                project=self.config.project,
-                timeout=self.config.timeout,
-            )
-            if OpenAI and self.config.api_key
-            else None
-        )
         self.logger = logging.getLogger(__name__)
+        self.config = config or SummarizerConfig()
+        self.caption_proxy_config = load_proxy_egress_config(purpose="captions")
+        self.http_proxy_config = load_proxy_egress_config(purpose="http_summarizer")
+        self.client = None
+        if OpenAI and self.config.api_key:
+            client_kwargs = {
+                "api_key": self.config.api_key,
+                "base_url": self.config.base_url,
+                "organization": self.config.organization,
+                "project": self.config.project,
+                "timeout": self.config.timeout,
+            }
+            if not self.config.openai_trust_env_proxy and DefaultHttpxClient:
+                # Keep OpenAI transport direct unless explicitly overridden.
+                client_kwargs["http_client"] = DefaultHttpxClient(timeout=self.config.timeout, trust_env=False)
+            self.client = OpenAI(**client_kwargs)
+
+        proxy_env_set = any((os.getenv(name) or "").strip() for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"))
+        if self.client and proxy_env_set:
+            if self.config.openai_trust_env_proxy:
+                self.logger.warning(
+                    "OPENAI_TRUST_ENV_PROXY=true; OpenAI requests will use HTTP(S)_PROXY/ALL_PROXY environment settings."
+                )
+            else:
+                self.logger.info("OpenAI client configured with trust_env=False; ignoring HTTP(S)_PROXY/ALL_PROXY env vars.")
+
+    def _transcode_to_wav_retry(self, source: Path) -> Optional[Path]:
+        """Create a retry-friendly WAV for Whisper when compressed input is rejected."""
+        ffmpeg = self._resolve_ffmpeg()
+        if not ffmpeg:
+            return None
+        target_dir = Path(tempfile.mkdtemp(prefix="whisper_retry_"))
+        wav_path = target_dir / f"{source.stem}.retry.wav"
+        command = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(wav_path),
+        ]
+        try:
+            subprocess.run(command, check=True, capture_output=True)
+            if wav_path.exists():
+                return wav_path
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Whisper WAV retry transcode failed for %s: %s", source.name, exc)
+        return None
 
     def summarize_youtube_captions_only(self, youtube_url: str) -> SummarizeResult:
         """
@@ -334,21 +388,49 @@ class CloudSummarizerClient:
         if not self.config.endpoint:
             raise RuntimeError("SUMMARIZER_HTTP_ENDPOINT must be set for HTTP summarization")
         headers = {"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}
-        with audio.open("rb") as handle:
-            files = {"file": (audio.name, handle, "application/octet-stream")}
-            response = requests.post(
-                self.config.endpoint,
-                headers=headers,
-                data={"model": self.config.model},
-                files=files,
-                timeout=self.config.timeout,
-            )
-        response.raise_for_status()
-        payload = response.json()
-        summary = payload.get("summary")
-        if not summary:
-            raise RuntimeError("Cloud summarization endpoint did not return a 'summary' field")
-        return summary
+        proxy_config = self.http_proxy_config
+        attempts = proxy_config.max_retries if proxy_config.enabled else 1
+        attempts = max(1, attempts)
+        last_error: Optional[Exception] = None
+        for attempt_idx in range(attempts):
+            proxy_url = select_proxy_for_attempt(proxy_config, attempt_idx, stable_key=self.config.endpoint)
+            req_proxies = build_requests_proxies(proxy_url)
+            proxy_label = redact_proxy(proxy_url)
+            proxy_slot = proxy_index(proxy_config, proxy_url)
+            try:
+                with audio.open("rb") as handle:
+                    files = {"file": (audio.name, handle, "application/octet-stream")}
+                    response = requests.post(
+                        self.config.endpoint,
+                        headers=headers,
+                        data={"model": self.config.model},
+                        files=files,
+                        timeout=self.config.timeout,
+                        proxies=req_proxies,
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                summary = payload.get("summary")
+                if not summary:
+                    raise RuntimeError("Cloud summarization endpoint did not return a 'summary' field")
+                return summary
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if is_rate_limited_error(str(exc)) and attempt_idx + 1 < attempts:
+                    self.logger.warning(
+                        "HTTP summarizer rate-limited (attempt %s/%s, egress=%s, proxy_slot=%s); retrying.",
+                        attempt_idx + 1,
+                        attempts,
+                        proxy_label,
+                        proxy_slot or "n/a",
+                    )
+                    sleep_backoff(proxy_config, attempt_idx)
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("Cloud summarization endpoint failed with unknown error")
 
     def _extract_audio(self, source: Path) -> Path:
         """Extract or recompress audio to reduce file size for transcription."""
@@ -555,16 +637,72 @@ class CloudSummarizerClient:
         segments = self._segment_audio(audio_file)
         transcripts: list[str] = []
         
-        for segment in segments:
-            with segment.open("rb") as handle:
-                transcription = self.client.audio.transcriptions.create(
-                    model=self.config.transcription_model,
-                    file=handle,
-                    response_format="text",
-                )
-            normalized = str(transcription).strip()
-            if normalized:
-                transcripts.append(normalized)
+        for idx, segment in enumerate(segments, start=1):
+            seg_size_mb = segment.stat().st_size / (1024 * 1024) if segment.exists() else 0.0
+            seg_duration = self._probe_duration_seconds(segment)
+            self.logger.info(
+                "Whisper request segment=%s/%s file=%s size_mb=%.2f duration_s=%s model=%s",
+                idx,
+                len(segments),
+                segment.name,
+                seg_size_mb,
+                f"{seg_duration:.1f}" if seg_duration else "unknown",
+                self.config.transcription_model,
+            )
+
+            retry_candidates: list[Path] = [segment]
+            wav_retry = self._transcode_to_wav_retry(segment)
+            if wav_retry:
+                retry_candidates.append(wav_retry)
+
+            last_error: Optional[Exception] = None
+            for candidate_idx, candidate in enumerate(retry_candidates, start=1):
+                cand_size_mb = candidate.stat().st_size / (1024 * 1024) if candidate.exists() else 0.0
+                try:
+                    with candidate.open("rb") as handle:
+                        transcription = self.client.audio.transcriptions.create(
+                            model=self.config.transcription_model,
+                            file=handle,
+                            response_format="text",
+                        )
+                    normalized = str(transcription).strip()
+                    if normalized:
+                        transcripts.append(normalized)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    error_body = getattr(exc, "body", None)
+                    if not error_body:
+                        response = getattr(exc, "response", None)
+                        if response is not None:
+                            try:
+                                error_body = response.text
+                            except Exception:  # noqa: BLE001
+                                error_body = None
+                    self.logger.error(
+                        "Whisper transcription failed segment=%s/%s attempt=%s/%s file=%s size_mb=%.2f error=%s body=%s",
+                        idx,
+                        len(segments),
+                        candidate_idx,
+                        len(retry_candidates),
+                        candidate.name,
+                        cand_size_mb,
+                        exc,
+                        str(error_body)[:500] if error_body else "n/a",
+                    )
+                    if (
+                        BadRequestError
+                        and isinstance(exc, BadRequestError)
+                        and candidate_idx < len(retry_candidates)
+                    ):
+                        self.logger.warning(
+                            "Retrying Whisper segment=%s with WAV fallback after bad request.", idx
+                        )
+                        continue
+                    raise
+            else:
+                if last_error:
+                    raise last_error
 
         if not transcripts:
             return (
@@ -666,7 +804,18 @@ class CloudSummarizerClient:
         if not STRICT_COOKIES:
             cookie_attempts.append(("none", None))
 
-        try:
+        proxy_config = self.caption_proxy_config
+        attempts = proxy_config.max_retries if proxy_config.enabled else 1
+        attempts = max(1, attempts)
+        last_status = "extract_info_failed"
+        last_detail: Optional[str] = None
+
+        for attempt_idx in range(attempts):
+            proxy_url = select_proxy_for_attempt(proxy_config, attempt_idx, stable_key=url)
+            proxy_slot = proxy_index(proxy_config, proxy_url)
+            proxy_label = redact_proxy(proxy_url)
+            req_proxies = build_requests_proxies(proxy_url)
+
             info = None
             last_inner_error: Optional[str] = None
             for extractor_arg in extractor_args_list:
@@ -677,6 +826,10 @@ class CloudSummarizerClient:
                         ydl_opts["js_runtimes"] = _js_runtime_dict()
                     if REMOTE_COMPONENTS:
                         ydl_opts["remote_components"] = REMOTE_COMPONENTS
+                    if proxy_url:
+                        ydl_opts["proxy"] = proxy_url
+                    else:
+                        ydl_opts.pop("proxy", None)
                     if cookie_mode == "browser" and browser_cookie and cookie_value:
                         ydl_opts["cookiesfrombrowser"] = (browser_cookie, cookie_value, None, None)
                         ydl_opts.pop("cookiefile", None)
@@ -693,7 +846,15 @@ class CloudSummarizerClient:
                             cookie_label = f"file:{cookie_value}"
                         else:
                             cookie_label = "none"
-                        self.logger.info("yt-dlp captions extractor=%s cookies=%s", extractor_arg, cookie_label)
+                        self.logger.info(
+                            "yt-dlp captions extractor=%s cookies=%s egress=%s proxy_slot=%s attempt=%s/%s",
+                            extractor_arg,
+                            cookie_label,
+                            proxy_label,
+                            proxy_slot or "n/a",
+                            attempt_idx + 1,
+                            attempts,
+                        )
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
                         if info:
@@ -701,86 +862,119 @@ class CloudSummarizerClient:
                     except Exception as inner_exc:  # noqa: BLE001
                         last_inner_error = str(inner_exc)
                         self.logger.debug(
-                            "Caption fetch failed extractor=%s cookie_mode=%s error=%s",
+                            "Caption fetch failed extractor=%s cookie_mode=%s proxy_slot=%s error=%s",
                             extractor_arg,
                             cookie_mode,
+                            proxy_slot or "n/a",
                             inner_exc,
                         )
                         continue
                 else:
                     continue
                 break
+
             if not info:
-                detail = last_inner_error
-                text, source, status, transcript_detail = _maybe_try_transcript_api()
-                if text:
-                    return (text, source, status or "success", transcript_detail)
-                if status and transcript_detail:
-                    detail = f"yt_dlp={last_inner_error}; transcript_api={status}: {transcript_detail}"
-                return (None, None, "extract_info_failed", detail)
-        except Exception as exc:  # noqa: BLE001
-            detail = str(exc)
-            text, source, status, transcript_detail = _maybe_try_transcript_api()
-            if text:
-                return (text, source, status or "success", transcript_detail)
-            if status and transcript_detail:
-                detail = f"yt_dlp={detail}; transcript_api={status}: {transcript_detail}"
-            return (None, None, "extract_info_failed", detail)
+                last_status = "extract_info_failed"
+                last_detail = last_inner_error
+                if is_rate_limited_error(last_inner_error) and attempt_idx + 1 < attempts:
+                    self.logger.warning(
+                        "Rate-limited while fetching caption metadata (egress=%s proxy_slot=%s attempt=%s/%s). Rotating.",
+                        proxy_label,
+                        proxy_slot or "n/a",
+                        attempt_idx + 1,
+                        attempts,
+                    )
+                    sleep_backoff(proxy_config, attempt_idx)
+                    continue
+                break
 
-        subtitles = (info or {}).get("subtitles") or {}
-        auto_captions = (info or {}).get("automatic_captions") or {}
-        # Try human-provided subtitles first, then auto-generated captions.
-        for source_name, captions_map in (("youtube_subtitles", subtitles), ("youtube_auto_captions", auto_captions)):
-            candidates = []
-            for lang in ("en", "en-US", "en-GB"):
-                if lang in captions_map:
-                    candidates.extend(captions_map[lang])
-            if not candidates:
+            subtitles = (info or {}).get("subtitles") or {}
+            auto_captions = (info or {}).get("automatic_captions") or {}
+            retryable_fetch = False
+            for source_name, captions_map in (("youtube_subtitles", subtitles), ("youtube_auto_captions", auto_captions)):
+                candidates = []
+                for lang in ("en", "en-US", "en-GB"):
+                    if lang in captions_map:
+                        candidates.extend(captions_map[lang])
+                if not candidates:
+                    continue
+
+                last_fetch_error: Optional[str] = None
+                for entry in candidates:
+                    caption_url = entry.get("url")
+                    if not caption_url:
+                        continue
+                    try:
+                        resp = requests.get(caption_url, timeout=self.config.timeout, proxies=req_proxies)
+                        resp.raise_for_status()
+                        text_content = resp.text
+                        # Some caption endpoints return an HLS playlist (.m3u8) pointing to VTT chunks; follow it.
+                        if text_content.lstrip().startswith("#EXTM3U"):
+                            parts: list[str] = []
+                            for line in text_content.splitlines():
+                                line = line.strip()
+                                if not line or line.startswith("#"):
+                                    continue
+                                try:
+                                    seg_resp = requests.get(line, timeout=self.config.timeout, proxies=req_proxies)
+                                    seg_resp.raise_for_status()
+                                    parts.append(seg_resp.text)
+                                except Exception as seg_exc:  # noqa: BLE001
+                                    last_fetch_error = str(seg_exc)
+                                    self.logger.info(
+                                        "Failed to fetch caption segment proxy_slot=%s url=%s error=%s",
+                                        proxy_slot or "n/a",
+                                        line,
+                                        seg_exc,
+                                    )
+                                    continue
+                            if parts:
+                                text_content = "\n".join(parts)
+                        text = self._parse_caption_payload(text_content)
+                        if text:
+                            self.logger.info(
+                                "Using YouTube captions source=%s for %s (proxy_slot=%s)",
+                                source_name,
+                                url,
+                                proxy_slot or "n/a",
+                            )
+                            return (text, source_name, "success", None)
+                        last_fetch_error = "parsed captions were empty"
+                    except Exception as exc:  # noqa: BLE001
+                        last_fetch_error = str(exc)
+                        self.logger.info("Failed to fetch/parse YouTube captions: %s", exc)
+                        continue
+
+                last_status = "fetch_parse_failed"
+                last_detail = last_fetch_error
+                if is_rate_limited_error(last_fetch_error) and attempt_idx + 1 < attempts:
+                    retryable_fetch = True
+                    break
+                return (None, None, "fetch_parse_failed", last_fetch_error)
+
+            if retryable_fetch:
+                self.logger.warning(
+                    "Rate-limited while fetching caption payload (egress=%s proxy_slot=%s attempt=%s/%s). Rotating.",
+                    proxy_label,
+                    proxy_slot or "n/a",
+                    attempt_idx + 1,
+                    attempts,
+                )
+                sleep_backoff(proxy_config, attempt_idx)
                 continue
-            last_fetch_error: Optional[str] = None
-            for entry in candidates:
-                caption_url = entry.get("url")
-                if not caption_url:
-                    continue
-                try:
-                    resp = requests.get(caption_url, timeout=self.config.timeout)
-                    resp.raise_for_status()
-                    text_content = resp.text
-                    # Some caption endpoints return an HLS playlist (.m3u8) pointing to VTT chunks; follow it.
-                    if text_content.lstrip().startswith("#EXTM3U"):
-                        parts: list[str] = []
-                        for line in text_content.splitlines():
-                            line = line.strip()
-                            if not line or line.startswith("#"):
-                                continue
-                            try:
-                                seg_resp = requests.get(line, timeout=self.config.timeout)
-                                seg_resp.raise_for_status()
-                                parts.append(seg_resp.text)
-                            except Exception as seg_exc:  # noqa: BLE001
-                                last_fetch_error = str(seg_exc)
-                                self.logger.info("Failed to fetch caption segment %s: %s", line, seg_exc)
-                                continue
-                        if parts:
-                            text_content = "\n".join(parts)
-                    text = self._parse_caption_payload(text_content)
-                    if text:
-                        self.logger.info("Using YouTube captions source=%s for %s", source_name, url)
-                        return (text, source_name, "success", None)
-                    last_fetch_error = "parsed captions were empty"
-                except Exception as exc:  # noqa: BLE001
-                    last_fetch_error = str(exc)
-                    self.logger.info("Failed to fetch/parse YouTube captions: %s", exc)
-                    continue
-            return (None, None, "fetch_parse_failed", last_fetch_error)
 
-        detail = "No English captions found in subtitles/automatic_captions"
+            last_status = "no_en_captions"
+            last_detail = "No English captions found in subtitles/automatic_captions"
+            break
+
         text, source, status, transcript_detail = _maybe_try_transcript_api()
         if text:
             return (text, source, status or "success", transcript_detail)
+
+        detail = last_detail
         if status and transcript_detail:
-            detail = f"yt_dlp={detail}; transcript_api={status}: {transcript_detail}"
-        return (None, None, "no_en_captions", detail)
+            detail = f"yt_dlp={last_detail or 'unknown'}; transcript_api={status}: {transcript_detail}"
+        return (None, None, last_status, detail)
 
     def _parse_caption_payload(self, caption_text: str) -> str:
         """Parse YouTube captions returned as either VTT or JSON3 into human-readable text."""

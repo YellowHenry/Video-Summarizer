@@ -7,6 +7,14 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .config import HARDCODED_COOKIES_FROM_BROWSER, HARDCODED_COOKIES_BROWSER_PROFILE
+from .proxy_egress import (
+    is_rate_limited_error,
+    load_proxy_egress_config,
+    proxy_index,
+    redact_proxy,
+    select_proxy_for_attempt,
+    sleep_backoff,
+)
 from .ytdlp_cookies import resolve_cookies_file
 
 AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus"}
@@ -92,6 +100,7 @@ CHROME_USER_DATA = _chrome_user_data_root()
 class AudioDownloader:
     def __init__(self, download_root: Optional[Path] = None):
         self.download_root = download_root or Path(tempfile.gettempdir())
+        self.proxy_config = load_proxy_egress_config(purpose="audio_download")
         self.logger = logging.getLogger(__name__)
 
     def get_youtube_title(self, url: str) -> Optional[str]:
@@ -138,39 +147,70 @@ class AudioDownloader:
         except ImportError:
             return None
 
-        for extractor_arg in FALLBACK_EXTRACTOR_ARGS:
-            for cookies_flags, cookies_label in self._cookie_attempts():
-                ydl_opts = {
-                    "quiet": True,
-                    "no_warnings": True,
-                    "skip_download": True,
-                    "extract_flat": False,
-                    "extractor_args": {"youtube": [extractor_arg]},
-                }
-                if JS_RUNTIMES:
-                    ydl_opts["js_runtimes"] = _js_runtime_dict()
-                if REMOTE_COMPONENTS:
-                    ydl_opts["remote_components"] = REMOTE_COMPONENTS
-                if cookies_flags and cookies_flags[0] == "--cookies-from-browser":
-                    browser_spec = cookies_flags[1]
-                    browser, profile = browser_spec.split(":", 1)
-                    ydl_opts["cookiesfrombrowser"] = (browser, profile, None, None)
-                elif cookies_flags and cookies_flags[0] == "--cookies":
-                    ydl_opts["cookiefile"] = cookies_flags[1]
-                try:
-                    self.logger.info("yt-dlp title attempt extractor=%s cookies=%s", extractor_arg, cookies_label)
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        if info and info.get("title"):
-                            return info["title"]
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.debug(
-                        "Title fetch failed extractor=%s cookies=%s error=%s",
-                        extractor_arg,
-                        cookies_label,
-                        exc,
-                    )
-                    continue
+        attempts = self.proxy_config.max_retries if self.proxy_config.enabled else 1
+        attempts = max(1, attempts)
+        for attempt_idx in range(attempts):
+            proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=url)
+            proxy_slot = proxy_index(self.proxy_config, proxy_url)
+            proxy_label = redact_proxy(proxy_url)
+            last_error: Optional[str] = None
+
+            for extractor_arg in FALLBACK_EXTRACTOR_ARGS:
+                for cookies_flags, cookies_label in self._cookie_attempts():
+                    ydl_opts = {
+                        "quiet": True,
+                        "no_warnings": True,
+                        "skip_download": True,
+                        "extract_flat": False,
+                        "extractor_args": {"youtube": [extractor_arg]},
+                    }
+                    if JS_RUNTIMES:
+                        ydl_opts["js_runtimes"] = _js_runtime_dict()
+                    if REMOTE_COMPONENTS:
+                        ydl_opts["remote_components"] = REMOTE_COMPONENTS
+                    if proxy_url:
+                        ydl_opts["proxy"] = proxy_url
+                    if cookies_flags and cookies_flags[0] == "--cookies-from-browser":
+                        browser_spec = cookies_flags[1]
+                        browser, profile = browser_spec.split(":", 1)
+                        ydl_opts["cookiesfrombrowser"] = (browser, profile, None, None)
+                    elif cookies_flags and cookies_flags[0] == "--cookies":
+                        ydl_opts["cookiefile"] = cookies_flags[1]
+                    try:
+                        self.logger.info(
+                            "yt-dlp title attempt extractor=%s cookies=%s egress=%s proxy_slot=%s attempt=%s/%s",
+                            extractor_arg,
+                            cookies_label,
+                            proxy_label,
+                            proxy_slot or "n/a",
+                            attempt_idx + 1,
+                            attempts,
+                        )
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            info = ydl.extract_info(url, download=False)
+                            if info and info.get("title"):
+                                return info["title"]
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = str(exc)
+                        self.logger.debug(
+                            "Title fetch failed extractor=%s cookies=%s proxy_slot=%s error=%s",
+                            extractor_arg,
+                            cookies_label,
+                            proxy_slot or "n/a",
+                            exc,
+                        )
+                        continue
+
+            if is_rate_limited_error(last_error) and attempt_idx + 1 < attempts:
+                self.logger.warning(
+                    "yt-dlp title lookup rate-limited (proxy_slot=%s attempt=%s/%s). Rotating.",
+                    proxy_slot or "n/a",
+                    attempt_idx + 1,
+                    attempts,
+                )
+                sleep_backoff(self.proxy_config, attempt_idx)
+                continue
+            break
         return None
 
     def _resolve_ffmpeg(self) -> Optional[str]:
@@ -205,7 +245,6 @@ class AudioDownloader:
 
         # Try to find yt-dlp executable first, then fall back to python -m yt_dlp
         yt_dlp = shutil.which("yt-dlp")
-        extractor_arg = DEFAULT_EXTRACTOR_ARGS
 
         if yt_dlp:
             base_common = [
@@ -242,31 +281,62 @@ class AudioDownloader:
                 "m4a",
             ]
             base_common += _extra_cli_flags()
-        attempts = []
+        attempt_matrix = []
         for extractor_arg in FALLBACK_EXTRACTOR_ARGS:
             for cookies_flags, cookies_label in self._cookie_attempts():
-                attempt_with = base_common + ["--extractor-args", extractor_arg] + cookies_flags + [url]
-                attempts.append((extractor_arg, cookies_label, cookies_flags, attempt_with))
+                attempt_matrix.append((extractor_arg, cookies_label, cookies_flags))
+
+        proxy_attempts = self.proxy_config.max_retries if self.proxy_config.enabled else 1
+        proxy_attempts = max(1, proxy_attempts)
         last_error: Optional[str] = None
-        for extractor_arg, cookies_label, cookies_flags, attempt in attempts:
-            self.logger.info("yt-dlp attempt extractor=%s cookies=%s", extractor_arg, cookies_label)
-            try:
-                run_env = os.environ.copy()
-                if not (run_env.get("PATH") or "").strip():
-                    run_env["PATH"] = PATH_FALLBACK
-                result = subprocess.run(attempt, check=True, capture_output=True, text=True, env=run_env)
-                if output_path.exists():
-                    return output_path, title
-                temp_files = list(temp_dir.glob("*"))
-                if temp_files:
-                    for f in temp_files:
-                        if f.suffix in (".mp4", ".webm", ".mkv", ".m4a", ".mp3") and f.name != "download_error.log":
-                            return f, title
-                last_error = f"yt-dlp completed but no audio file was created. Output: {result.stdout}"
-            except subprocess.CalledProcessError as exc:  # noqa: PERF203
-                err_text = exc.stderr or exc.stdout or str(exc)
-                last_error = err_text
+        for attempt_idx in range(proxy_attempts):
+            proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=url)
+            proxy_slot = proxy_index(self.proxy_config, proxy_url)
+            proxy_label = redact_proxy(proxy_url)
+            rate_limited_this_round = False
+
+            for extractor_arg, cookies_label, cookies_flags in attempt_matrix:
+                proxy_flags = ["--proxy", proxy_url] if proxy_url else []
+                attempt = base_common + ["--extractor-args", extractor_arg] + cookies_flags + proxy_flags + [url]
+                self.logger.info(
+                    "yt-dlp attempt extractor=%s cookies=%s egress=%s proxy_slot=%s attempt=%s/%s",
+                    extractor_arg,
+                    cookies_label,
+                    proxy_label,
+                    proxy_slot or "n/a",
+                    attempt_idx + 1,
+                    proxy_attempts,
+                )
+                try:
+                    run_env = os.environ.copy()
+                    if not (run_env.get("PATH") or "").strip():
+                        run_env["PATH"] = PATH_FALLBACK
+                    result = subprocess.run(attempt, check=True, capture_output=True, text=True, env=run_env)
+                    if output_path.exists():
+                        return output_path, title
+                    temp_files = list(temp_dir.glob("*"))
+                    if temp_files:
+                        for f in temp_files:
+                            if f.suffix in (".mp4", ".webm", ".mkv", ".m4a", ".mp3") and f.name != "download_error.log":
+                                return f, title
+                    last_error = f"yt-dlp completed but no audio file was created. Output: {result.stdout}"
+                except subprocess.CalledProcessError as exc:  # noqa: PERF203
+                    err_text = exc.stderr or exc.stdout or str(exc)
+                    last_error = err_text
+                    if is_rate_limited_error(err_text):
+                        rate_limited_this_round = True
+                    continue
+
+            if rate_limited_this_round and attempt_idx + 1 < proxy_attempts:
+                self.logger.warning(
+                    "yt-dlp download rate-limited (proxy_slot=%s attempt=%s/%s). Rotating.",
+                    proxy_slot or "n/a",
+                    attempt_idx + 1,
+                    proxy_attempts,
+                )
+                sleep_backoff(self.proxy_config, attempt_idx)
                 continue
+            break
 
         error_log = temp_dir / "download_error.log"
         if last_error:
