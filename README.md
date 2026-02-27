@@ -33,6 +33,8 @@ Use this path if you want the local Tkinter UI instead of the web app.
   - `chat_messages`
   - `job_artifacts`
   - `vectors`
+- Auth: Google Sign-In (`/api/auth/me` + bearer token on all data endpoints)
+- Multi-profile isolation: jobs/artifacts/chat/search are scoped by signed-in Google account
 - Artifact storage:
   - Local (`storage/objects`) by default
   - GCS when `OBJECT_STORAGE_BACKEND=gcs` and `GCS_BUCKET` is set
@@ -49,6 +51,7 @@ Use this path if you want the local Tkinter UI instead of the web app.
 
 - `POST /api/uploads/presign`
 - `PUT /api/uploads/{object_key}` (local object-store fallback upload)
+- `GET /api/auth/me`
 - `POST /api/jobs`
 - `GET /api/jobs`
 - `GET /api/jobs/{job_id}`
@@ -76,6 +79,9 @@ pip install -r requirements.txt
 # Required for real transcription/summarization/embeddings
 set OPENAI_API_KEY=sk-...
 
+# Required for Google login (backend verifier + frontend client)
+set WEBAPP_GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
+
 # Required for queued background jobs (unless WEBAPP_SYNC_JOBS=true)
 set REDIS_URL=redis://localhost:6379/0
 ```
@@ -94,6 +100,7 @@ python -m backend.webapp.worker
 ```bash
 cd web
 npm install
+set VITE_GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
 npm run dev
 ```
 
@@ -187,7 +194,7 @@ Recommended managed services:
 - Cloud Run (`api` + optional `web`)
 - Persistent Compute Engine VM for worker (desktop-like Chrome cookies)
 - Cloud SQL Postgres
-- Memorystore Redis
+- Redis queue (`Memorystore` or Redis on the worker VM for cost-optimized mode)
 - GCS bucket for artifacts
 
 First-time local auth:
@@ -224,6 +231,7 @@ Automated deployment scripts are under `infra/gcp/`:
 - `infra/gcp/deploy_all.ps1` (Windows wrapper)
 - `infra/gcp/validate_deploy.sh` (post-deploy checks + optional smoke)
 - `infra/gcp/validate_deploy.ps1` (Windows wrapper)
+- `infra/gcp/rightsize_online_costs.sh` (Cloud SQL right-sizing helper with fallback)
 - `infra/gcp/run_backfill_with_cloudsql_proxy.sh` (local-to-CloudSQL backfill helper)
 - `infra/gcp/run_backfill_with_cloudsql_proxy.ps1` (Windows wrapper)
 - `infra/gcp/env.example.sh` (env template)
@@ -239,7 +247,7 @@ Current VM-worker behavior supports a split path:
 Key env/config controls:
 - `PROXY_ENABLED="true"` enables proxy logic.
 - `PROXY_CAPTIONS_ONLY="true"` proxies caption requests only; keeps audio download direct.
-- `PROXY_POOL` (or `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) sets the proxy endpoint(s).
+- `PROXY_POOL` sets the proxy endpoint(s).
 - `PROXY_MAX_RETRIES`, `PROXY_ROTATION_MODE`, `PROXY_BACKOFF_SECONDS` control retry/rotation.
 - `OPENAI_TRUST_ENV_PROXY="false"` keeps OpenAI traffic off proxy.
 
@@ -247,6 +255,31 @@ Example rotating endpoint:
 - `PROXY_POOL="http://<username>:<password>@p.webshare.io:80"`
 
 See `infra/gcp/README.md` for required env vars, VPC connector setup, service-account IAM, and deployment sequence.
+
+### Online Cost-Optimized Mode (keeps app on, lowers idle cost)
+
+If you want lower daily cost without "turning the app off", the repo now supports a VM-worker cost mode:
+- Keep API/web on Cloud Run and worker on the persistent VM.
+- Run Redis on the worker VM (`REDIS_RUNTIME="worker_vm"`) instead of Memorystore.
+- Downsize Cloud SQL to a shared-core tier (target `SQL_TIER="db-f1-micro"`, fallback `db-g1-small` via helper script).
+
+Key config/env knobs:
+- `REDIS_RUNTIME` = `memorystore` or `worker_vm`
+- `REDIS_VM_PORT`
+- `REDIS_VM_REQUIREPASS` (required when `REDIS_RUNTIME="worker_vm"`)
+- `REDIS_VM_FIREWALL_RULE`
+- `REDIS_VM_ALLOWED_SOURCE` (defaults to `VPC_CONNECTOR_RANGE`)
+- `SQL_TIER` (target tier for `infra/gcp/rightsize_online_costs.sh`)
+- optional `SQL_STORAGE_TYPE` (for example `PD_HDD`, if acceptable)
+
+Why this helps:
+- Managed Redis + always-on Cloud SQL are the main idle cost drivers in low-traffic usage.
+- VM Redis removes Memorystore cost while preserving queue behavior (`rq`).
+
+Tradeoffs:
+- VM Redis is cheaper but less managed than Memorystore (you own VM Redis uptime/config).
+- Shared-core Cloud SQL is slower than custom tiers, but often fine for small personal traffic.
+- `infra/gcp/pause_stack.sh` / `resume_stack.sh` still exist as optional "idle mode" controls; they are not required for this online cost-reduction mode.
 
 ## What Is Still Manual (By Design)
 

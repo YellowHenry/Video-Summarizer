@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from .auth import owner_key_from_email
 from .config import settings
 
 try:
@@ -28,9 +29,10 @@ def sanitize_object_key(key: str) -> str:
     return normalized.lstrip("/")
 
 
-def build_upload_object_key(filename: str) -> str:
+def build_upload_object_key(filename: str, owner_email: str) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).name)
-    return f"uploads/{uuid.uuid4().hex}_{safe_name}"
+    owner_key = owner_key_from_email(owner_email)
+    return f"uploads/{owner_key}/{uuid.uuid4().hex}_{safe_name}"
 
 
 class BaseObjectStore:

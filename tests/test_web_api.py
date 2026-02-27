@@ -32,11 +32,13 @@ def web_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     web_config.settings.object_backend = "local"
     web_config.settings.local_object_root = tmp_path / "objects"
     web_config.settings.api_base_url = "http://testserver"
+    web_config.settings.webapp_disable_auth = True
+    web_config.settings.webapp_dev_user_email = "dev@example.com"
+    web_config.settings.webapp_google_client_id = "test-google-client-id"
 
     monkeypatch.setattr(web_api, "SessionLocal", TestingSession)
     monkeypatch.setattr(web_tasks, "SessionLocal", TestingSession)
     monkeypatch.setattr(web_api, "run_migrations", lambda: None)
-    monkeypatch.setattr(web_tasks, "run_migrations", lambda: None)
 
     get_services.cache_clear()
     services = get_services()
@@ -116,6 +118,16 @@ def test_job_creation_and_enqueue(web_env, monkeypatch: pytest.MonkeyPatch):
         row = session.get(JobRecord, payload["job_id"])
         assert row is not None
         assert row.status == "queued"
+        assert row.owner_email == "dev@example.com"
+
+
+def test_jobs_requires_auth_when_enabled(web_env):
+    web_config.settings.webapp_disable_auth = False
+    web_config.settings.webapp_google_client_id = "test-google-client-id"
+    client = TestClient(web_api.app)
+    response = client.get("/api/jobs")
+    assert response.status_code == 401
+    web_config.settings.webapp_disable_auth = True
 
 
 def test_chat_persistence_round_trip(web_env, monkeypatch: pytest.MonkeyPatch):
@@ -124,6 +136,7 @@ def test_chat_persistence_round_trip(web_env, monkeypatch: pytest.MonkeyPatch):
 
     with SessionLocal() as session:
         job = JobRecord(
+            owner_email="dev@example.com",
             source_type="youtube",
             source_url="https://www.youtube.com/watch?v=chat1",
             status="complete",
@@ -163,6 +176,7 @@ def test_job_chat_uses_full_transcript_and_prior_history(web_env, monkeypatch: p
 
     with SessionLocal() as session:
         job = JobRecord(
+            owner_email="dev@example.com",
             source_type="youtube",
             source_url="https://www.youtube.com/watch?v=chatctx",
             status="complete",
@@ -211,6 +225,7 @@ def test_worker_state_transitions_and_artifacts(web_env, monkeypatch: pytest.Mon
 
     with SessionLocal() as session:
         job = JobRecord(
+            owner_email="dev@example.com",
             source_type="youtube",
             source_url="https://www.youtube.com/watch?v=worker1",
             status="queued",
@@ -250,6 +265,7 @@ def test_worker_transient_failure_requeues(web_env, monkeypatch: pytest.MonkeyPa
     SessionLocal = web_env["session"]
     with SessionLocal() as session:
         job = JobRecord(
+            owner_email="dev@example.com",
             source_type="youtube",
             source_url="https://www.youtube.com/watch?v=retriable",
             status="queued",
@@ -314,8 +330,20 @@ def test_integration_upload_to_summary_retrieval(web_env, monkeypatch: pytest.Mo
 
 def test_search_returns_chunk_links(web_env, monkeypatch: pytest.MonkeyPatch):
     services = get_services()
+    SessionLocal = web_env["session"]
     local_file = web_env["tmp_path"] / "hit_transcript.txt"
     local_file.write_text("A baseball discussion snippet from transcript.", encoding="utf-8")
+
+    with SessionLocal() as session:
+        job = JobRecord(
+            id="job123",
+            owner_email="dev@example.com",
+            source_type="youtube",
+            source_url="https://youtube.com/watch?v=job123",
+            status="complete",
+        )
+        session.add(job)
+        session.commit()
 
     hit = VectorRecord(
         text="A baseball discussion snippet from transcript.",

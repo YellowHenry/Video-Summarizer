@@ -14,6 +14,8 @@ class QAResult:
 
 
 class QAService:
+    _JOB_CHAT_CONTINUE_PROMPT = "Continue exactly where you left off. Do not repeat prior text."
+
     def __init__(self, vector_store: Optional[VectorStore] = None, summarizer_client: Optional[CloudSummarizerClient] = None):
         self.vector_store = vector_store or VectorStore()
         self.summarizer = summarizer_client or CloudSummarizerClient(SummarizerConfig())
@@ -105,19 +107,94 @@ class QAService:
         messages.extend(history)
         messages.append({"role": "user", "content": question})
 
+        max_tokens = max(1, int(self.summarizer.config.job_chat_max_tokens))
+        auto_continue = bool(self.summarizer.config.job_chat_auto_continue_enabled)
+        max_segments = max(1, int(self.summarizer.config.job_chat_auto_continue_max_segments))
         self.logger.info(
-            "Job chat using full transcript context: transcript_chars=%d history_turns=%d",
+            (
+                "Job chat using full transcript context: transcript_chars=%d history_turns=%d "
+                "job_chat_max_tokens=%d auto_continue=%s max_segments=%d"
+            ),
             len(cleaned_transcript),
             len(history),
+            max_tokens,
+            auto_continue,
+            max_segments,
         )
-        completion = self.summarizer.client.chat.completions.create(
-            model=self.summarizer.config.model,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=500,
+
+        segment_texts: List[str] = []
+        finish_reasons: List[str] = []
+        working_messages = list(messages)
+        segment_count = 0
+        truncated_after_continuations = False
+
+        while True:
+            completion = self.summarizer.client.chat.completions.create(
+                model=self.summarizer.config.model,
+                messages=working_messages,
+                temperature=0.2,
+                max_tokens=max_tokens,
+            )
+            choice = completion.choices[0]
+            raw_content = getattr(choice.message, "content", None)
+            segment_text = str(raw_content or "").strip()
+            finish_reason = str(getattr(choice, "finish_reason", None) or "unknown")
+            segment_count += 1
+            finish_reasons.append(finish_reason)
+            segment_texts.append(segment_text)
+
+            self.logger.info(
+                "Job chat segment=%d finish_reason=%s chars=%d",
+                segment_count,
+                finish_reason,
+                len(segment_text),
+            )
+
+            if finish_reason != "length":
+                break
+
+            if not auto_continue:
+                truncated_after_continuations = True
+                break
+
+            if segment_count >= max_segments:
+                truncated_after_continuations = True
+                break
+
+            if not segment_text:
+                self.logger.warning(
+                    "Job chat auto-continue stopped after empty length-limited segment (segment=%d)",
+                    segment_count,
+                )
+                truncated_after_continuations = True
+                break
+
+            working_messages.append({"role": "assistant", "content": segment_text})
+            working_messages.append({"role": "user", "content": self._JOB_CHAT_CONTINUE_PROMPT})
+
+        answer = self._join_job_chat_segments(segment_texts).strip()
+        if not answer:
+            answer = "I could not generate a response for this job chat question."
+
+        self.logger.info(
+            (
+                "Job chat complete: transcript_chars=%d history_turns=%d segments=%d "
+                "auto_continue_used=%s truncated_after_continuations=%s finish_reasons=%s"
+            ),
+            len(cleaned_transcript),
+            len(history),
+            segment_count,
+            segment_count > 1,
+            truncated_after_continuations,
+            ",".join(finish_reasons) or "none",
         )
-        answer = completion.choices[0].message.content.strip()
-        contexts = [f"full_transcript_chars={len(cleaned_transcript)}", f"history_turns={len(history)}"]
+
+        contexts = [
+            f"full_transcript_chars={len(cleaned_transcript)}",
+            f"history_turns={len(history)}",
+            f"job_chat_segments={segment_count}",
+            f"job_chat_truncated_after_continuations={str(truncated_after_continuations).lower()}",
+        ]
         return QAResult(answer=answer, contexts=contexts, hits=[])
 
     @staticmethod
@@ -135,3 +212,29 @@ class QAService:
                 continue
             normalized.append({"role": role, "content": cleaned})
         return normalized
+
+    @classmethod
+    def _join_job_chat_segments(cls, segments: Sequence[str]) -> str:
+        combined = ""
+        for raw_segment in segments:
+            segment = (raw_segment or "").strip()
+            if not segment:
+                continue
+            if not combined:
+                combined = segment
+                continue
+            trimmed = cls._trim_overlapping_prefix(combined, segment)
+            if trimmed:
+                combined = f"{combined}\n{trimmed}"
+        return combined
+
+    @staticmethod
+    def _trim_overlapping_prefix(existing: str, new_segment: str) -> str:
+        """Trim exact suffix/prefix overlap to reduce repeated continuation text."""
+        if not existing or not new_segment:
+            return new_segment
+        max_overlap = min(len(existing), len(new_segment), 1000)
+        for overlap in range(max_overlap, 0, -1):
+            if existing[-overlap:] == new_segment[:overlap]:
+                return new_segment[overlap:].lstrip()
+        return new_segment

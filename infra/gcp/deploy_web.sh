@@ -5,10 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/load_python_env.sh"
 
+gcloud() {
+  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy gcloud "$@"
+}
+
 : "${PROJECT_ID:?PROJECT_ID is required}"
 : "${REGION:?REGION is required}"
 : "${REPO:?REPO is required}"
 : "${IMAGE_WEB:?IMAGE_WEB is required}"
+: "${GOOGLE_OAUTH_CLIENT_ID:?GOOGLE_OAUTH_CLIENT_ID is required}"
 : "${API_SERVICE:=audio-summarizer-api}"
 : "${WEB_SERVICE:=audio-summarizer-web}"
 : "${WEB_PORT:=80}"
@@ -66,7 +71,7 @@ build_image() {
 
 ensure_registry_auth
 
-build_image ./web -f web/Dockerfile --build-arg VITE_API_BASE_URL="${API_URL}" -t "${WEB_URI}"
+build_image ./web -f web/Dockerfile --build-arg VITE_API_BASE_URL="${API_URL}" --build-arg VITE_GOOGLE_CLIENT_ID="${GOOGLE_OAUTH_CLIENT_ID}" -t "${WEB_URI}"
 docker push "${WEB_URI}"
 
 gcloud run deploy "${WEB_SERVICE}" \

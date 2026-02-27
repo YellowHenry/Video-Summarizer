@@ -31,6 +31,7 @@ class Storage:
             "display_name": getattr(job, "display_name", None),
             "status": getattr(job, "status", None),
             "prefer_youtube_captions": getattr(job, "prefer_youtube_captions", None),
+            "allow_whisper_fallback": getattr(job, "allow_whisper_fallback", None),
             "transcript_source": getattr(job, "transcript_source", None),
             "captions_attempted": getattr(job, "captions_attempted", None),
             "captions_status": getattr(job, "captions_status", None),
@@ -129,6 +130,7 @@ class Storage:
             status = "complete"
             transcript_source = None
             prefer_youtube_captions = None
+            allow_whisper_fallback = None
             captions_attempted = None
             captions_status = None
             captions_detail = None
@@ -142,6 +144,7 @@ class Storage:
                     status = meta.get("status", status)
                     transcript_source = meta.get("transcript_source")
                     prefer_youtube_captions = meta.get("prefer_youtube_captions")
+                    allow_whisper_fallback = meta.get("allow_whisper_fallback")
                     captions_attempted = meta.get("captions_attempted")
                     captions_status = meta.get("captions_status")
                     captions_detail = meta.get("captions_detail")
@@ -176,6 +179,7 @@ class Storage:
                         "status",
                         "transcript_source",
                         "prefer_youtube_captions",
+                        "allow_whisper_fallback",
                         "captions_attempted",
                         "captions_status",
                         "captions_detail",
@@ -192,6 +196,7 @@ class Storage:
                             "display_name": title,
                             "status": status,
                             "prefer_youtube_captions": prefer_youtube_captions,
+                            "allow_whisper_fallback": allow_whisper_fallback,
                             "transcript_source": transcript_source,
                             "captions_attempted": captions_attempted,
                             "captions_status": captions_status,

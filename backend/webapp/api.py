@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .auth import AuthUser, owner_key_from_email, require_user
 from .config import settings
 from .db import SessionLocal
 from .logging_config import configure_logging
@@ -18,6 +19,7 @@ from .object_store import build_upload_object_key, infer_mime_type, sanitize_obj
 from .queueing import enqueue_job
 from .services import ServiceContainer, get_services
 from .schemas import (
+    AuthMeResponse,
     ArtifactResponse,
     ChatAnswerResponse,
     ChatMessageOut,
@@ -76,6 +78,34 @@ def get_service_container() -> ServiceContainer:
     return get_services()
 
 
+def _normalize_owner_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def _assert_upload_key_owner(object_key: str, owner_email: str) -> None:
+    owner_prefix = f"uploads/{owner_key_from_email(owner_email)}/"
+    if not object_key.startswith(owner_prefix):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+
+def _assert_object_access(object_key: str, owner_email: str, metadata: MetadataStore) -> None:
+    owner_prefix = f"uploads/{owner_key_from_email(owner_email)}/"
+    if object_key.startswith(owner_prefix):
+        return
+
+    if object_key.startswith("jobs/"):
+        parts = object_key.split("/", 2)
+        if len(parts) >= 3:
+            job_id = parts[1]
+            if metadata.get_job(job_id, owner_email):
+                return
+
+    if metadata.has_object_access(object_key, owner_email):
+        return
+
+    raise HTTPException(status_code=404, detail="Artifact not found")
+
+
 def _job_to_summary(job: JobRecord) -> JobSummary:
     return JobSummary(
         id=job.id,
@@ -98,6 +128,7 @@ def _job_to_detail(job: JobRecord) -> JobDetail:
         source_url=job.source_url,
         title=job.title,
         prefer_youtube_captions=job.prefer_youtube_captions,
+        allow_whisper_fallback=True if job.allow_whisper_fallback is None else bool(job.allow_whisper_fallback),
         transcript_source=job.transcript_source,
         captions_attempted=job.captions_attempted,
         captions_status=job.captions_status,
@@ -113,10 +144,15 @@ def healthz() -> dict:
     return {"ok": True}
 
 
+@app.get("/api/auth/me", response_model=AuthMeResponse)
+def auth_me(current_user: AuthUser = Depends(require_user)) -> AuthMeResponse:
+    return AuthMeResponse(email=current_user.email, name=current_user.name, picture=current_user.picture)
+
+
 @app.post("/api/uploads/presign", response_model=PresignUploadResponse)
-def presign_upload(payload: PresignUploadRequest) -> PresignUploadResponse:
+def presign_upload(payload: PresignUploadRequest, current_user: AuthUser = Depends(require_user)) -> PresignUploadResponse:
     object_store = get_service_container().object_store
-    object_key = build_upload_object_key(payload.filename)
+    object_key = build_upload_object_key(payload.filename, current_user.email)
     upload_url = object_store.generate_upload_url(object_key, payload.mime_type, settings.upload_url_expiry_seconds)
     return PresignUploadResponse(
         object_key=object_key,
@@ -126,13 +162,18 @@ def presign_upload(payload: PresignUploadRequest) -> PresignUploadResponse:
 
 
 @app.put("/api/uploads/{object_key:path}")
-async def upload_local_object(object_key: str, request: Request) -> dict:
+async def upload_local_object(
+    object_key: str,
+    request: Request,
+    current_user: AuthUser = Depends(require_user),
+) -> dict:
     """
     Local-object-store upload fallback endpoint.
     For GCS presigned uploads, clients should PUT directly to GCS.
     """
     object_store = get_service_container().object_store
     object_key = sanitize_object_key(object_key)
+    _assert_upload_key_owner(object_key, current_user.email)
     data = await request.body()
     content_type = request.headers.get("content-type") or infer_mime_type(object_key)
     object_store.put_bytes(object_key, data, content_type=content_type)
@@ -140,9 +181,15 @@ async def upload_local_object(object_key: str, request: Request) -> dict:
 
 
 @app.get("/api/artifacts/{object_key:path}")
-def get_local_object(object_key: str) -> Response:
+def get_local_object(
+    object_key: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(require_user),
+) -> Response:
     object_store = get_service_container().object_store
+    metadata = MetadataStore(db)
     object_key = sanitize_object_key(object_key)
+    _assert_object_access(object_key, current_user.email, metadata)
     if not object_store.exists(object_key):
         raise HTTPException(status_code=404, detail="Artifact not found")
     data = object_store.get_bytes(object_key)
@@ -151,27 +198,38 @@ def get_local_object(object_key: str) -> Response:
 
 
 @app.post("/api/jobs", response_model=CreateJobResponse)
-def create_job(payload: CreateJobRequest, metadata: MetadataStore = Depends(get_metadata_store)) -> CreateJobResponse:
+def create_job(
+    payload: CreateJobRequest,
+    metadata: MetadataStore = Depends(get_metadata_store),
+    current_user: AuthUser = Depends(require_user),
+) -> CreateJobResponse:
     has_youtube = bool(payload.youtube_url)
     has_upload = bool(payload.uploaded_object_key)
     if has_youtube == has_upload:
         raise HTTPException(status_code=400, detail="Provide exactly one of youtube_url or uploaded_object_key")
+
+    uploaded_object_key = None
+    if payload.uploaded_object_key:
+        uploaded_object_key = sanitize_object_key(payload.uploaded_object_key)
+        _assert_upload_key_owner(uploaded_object_key, current_user.email)
 
     source_type = "youtube" if has_youtube else "upload"
     job = metadata.create_job(
         NewJobParams(
             source_type=source_type,
             source_url=payload.youtube_url,
-            uploaded_object_key=payload.uploaded_object_key,
+            uploaded_object_key=uploaded_object_key,
             prefer_youtube_captions=payload.prefer_youtube_captions,
-        )
+            allow_whisper_fallback=payload.allow_whisper_fallback,
+        ),
+        owner_email=_normalize_owner_email(current_user.email),
     )
-    if payload.uploaded_object_key:
+    if uploaded_object_key:
         metadata.upsert_artifact(
             job.id,
             "upload",
-            payload.uploaded_object_key,
-            content_type=infer_mime_type(payload.uploaded_object_key),
+            uploaded_object_key,
+            content_type=infer_mime_type(uploaded_object_key),
         )
 
     try:
@@ -190,14 +248,21 @@ def create_job(payload: CreateJobRequest, metadata: MetadataStore = Depends(get_
 
 
 @app.get("/api/jobs", response_model=list[JobSummary])
-def list_jobs(metadata: MetadataStore = Depends(get_metadata_store)) -> list[JobSummary]:
-    jobs = metadata.list_jobs()
+def list_jobs(
+    metadata: MetadataStore = Depends(get_metadata_store),
+    current_user: AuthUser = Depends(require_user),
+) -> list[JobSummary]:
+    jobs = metadata.list_jobs(_normalize_owner_email(current_user.email))
     return [_job_to_summary(job) for job in jobs]
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobDetail)
-def get_job(job_id: str, db: Session = Depends(get_db)) -> JobDetail:
-    job = MetadataStore(db).get_job(job_id)
+def get_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(require_user),
+) -> JobDetail:
+    job = MetadataStore(db).get_job(job_id, _normalize_owner_email(current_user.email))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return _job_to_detail(job)
@@ -244,27 +309,39 @@ def _artifact_from_job(
 
 
 @app.get("/api/jobs/{job_id}/summary", response_model=ArtifactResponse)
-def get_summary(job_id: str, db: Session = Depends(get_db)) -> ArtifactResponse:
+def get_summary(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(require_user),
+) -> ArtifactResponse:
     metadata = MetadataStore(db)
-    job = metadata.get_job(job_id)
+    job = metadata.get_job(job_id, _normalize_owner_email(current_user.email))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return _artifact_from_job(job_id, job.summary_object_key, "summary.txt", metadata=metadata)
 
 
 @app.get("/api/jobs/{job_id}/transcript", response_model=ArtifactResponse)
-def get_transcript(job_id: str, db: Session = Depends(get_db)) -> ArtifactResponse:
+def get_transcript(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(require_user),
+) -> ArtifactResponse:
     metadata = MetadataStore(db)
-    job = metadata.get_job(job_id)
+    job = metadata.get_job(job_id, _normalize_owner_email(current_user.email))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return _artifact_from_job(job_id, job.transcript_object_key, "transcript.txt", metadata=metadata)
 
 
 @app.get("/api/jobs/{job_id}/chat", response_model=ChatResponse)
-def get_job_chat(job_id: str, db: Session = Depends(get_db)) -> ChatResponse:
+def get_job_chat(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(require_user),
+) -> ChatResponse:
     metadata = MetadataStore(db)
-    if not metadata.get_job(job_id):
+    if not metadata.get_job(job_id, _normalize_owner_email(current_user.email)):
         raise HTTPException(status_code=404, detail="Job not found")
     rows = metadata.list_chat(job_id)
     messages = [ChatMessageOut(id=row.id, role=row.role, content=row.content, created_at=row.created_at) for row in rows]
@@ -272,10 +349,15 @@ def get_job_chat(job_id: str, db: Session = Depends(get_db)) -> ChatResponse:
 
 
 @app.post("/api/jobs/{job_id}/chat", response_model=ChatAnswerResponse)
-def post_job_chat(job_id: str, payload: ChatRequest, db: Session = Depends(get_db)) -> ChatAnswerResponse:
+def post_job_chat(
+    job_id: str,
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(require_user),
+) -> ChatAnswerResponse:
     metadata = MetadataStore(db)
     services = get_service_container()
-    job = metadata.get_job(job_id)
+    job = metadata.get_job(job_id, _normalize_owner_email(current_user.email))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -307,21 +389,31 @@ def post_job_chat(job_id: str, payload: ChatRequest, db: Session = Depends(get_d
 
 
 @app.post("/api/search", response_model=SearchResponse)
-def search(payload: SearchRequest, db: Session = Depends(get_db)) -> SearchResponse:
+def search(
+    payload: SearchRequest,
+    db: Session = Depends(get_db),
+    current_user: AuthUser = Depends(require_user),
+) -> SearchResponse:
     services = get_service_container()
     object_store = services.object_store
     metadata = MetadataStore(db)
+    owner_email = _normalize_owner_email(current_user.email)
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
-    job_ids_filter: set[str] | None = None
+    owner_job_ids = metadata.list_job_ids(owner_email)
+    if not owner_job_ids:
+        return SearchResponse(answer="No jobs found for this account yet.", hits=[])
+
+    job_ids_filter: set[str] = set(owner_job_ids)
     if payload.created_after or payload.created_before:
-        stmt = select(JobRecord.id)
+        stmt = select(JobRecord.id).where(JobRecord.owner_email == owner_email)
         if payload.created_after:
             stmt = stmt.where(JobRecord.created_at >= payload.created_after)
         if payload.created_before:
             stmt = stmt.where(JobRecord.created_at <= payload.created_before)
-        job_ids_filter = {row[0] for row in db.execute(stmt).all()}
+        filtered_ids = {str(row[0]) for row in db.execute(stmt).all()}
+        job_ids_filter &= filtered_ids
         if not job_ids_filter:
             return SearchResponse(answer="No matching jobs found for the selected date range.", hits=[])
 

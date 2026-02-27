@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/load_python_env.sh"
 
+gcloud() {
+  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy gcloud "$@"
+}
+
 : "${REGION:?REGION is required}"
 : "${SERVICE:?SERVICE is required}"
 : "${DOMAIN:?DOMAIN is required}"

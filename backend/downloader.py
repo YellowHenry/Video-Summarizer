@@ -15,6 +15,7 @@ from .proxy_egress import (
     select_proxy_for_attempt,
     sleep_backoff,
 )
+from .youtube_url import canonicalize_youtube_video_url, extract_youtube_video_id, unwrap_ytdlp_video_info
 from .ytdlp_cookies import resolve_cookies_file
 
 AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus"}
@@ -146,11 +147,13 @@ class AudioDownloader:
             import yt_dlp
         except ImportError:
             return None
+        normalized_url = canonicalize_youtube_video_url(url)
+        target_video_id = extract_youtube_video_id(url)
 
         attempts = self.proxy_config.max_retries if self.proxy_config.enabled else 1
         attempts = max(1, attempts)
         for attempt_idx in range(attempts):
-            proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=url)
+            proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=normalized_url)
             proxy_slot = proxy_index(self.proxy_config, proxy_url)
             proxy_label = redact_proxy(proxy_url)
             last_error: Optional[str] = None
@@ -162,6 +165,7 @@ class AudioDownloader:
                         "no_warnings": True,
                         "skip_download": True,
                         "extract_flat": False,
+                        "noplaylist": True,
                         "extractor_args": {"youtube": [extractor_arg]},
                     }
                     if JS_RUNTIMES:
@@ -187,9 +191,31 @@ class AudioDownloader:
                             attempts,
                         )
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            info = ydl.extract_info(url, download=False)
-                            if info and info.get("title"):
-                                return info["title"]
+                            info = ydl.extract_info(normalized_url, download=False)
+                            resolved_info = unwrap_ytdlp_video_info(info, target_video_id)
+                            wrapper_detected = isinstance(info, dict) and info.get("entries") is not None
+                            wrapper_unwrapped = wrapper_detected and resolved_info is not info
+                            info_kind = "playlist_wrapper" if wrapper_detected else "video"
+                            info_id = None
+                            if isinstance(resolved_info, dict):
+                                info_id = resolved_info.get("id")
+                            self.logger.info(
+                                "yt-dlp title metadata submitted_url=%s normalized_url=%s noplaylist=true yt_info_type=%s yt_info_id=%s wrapper_unwrapped=%s",
+                                url,
+                                normalized_url,
+                                info_kind,
+                                info_id or "unknown",
+                                str(bool(wrapper_unwrapped)).lower(),
+                            )
+                            if wrapper_detected and not wrapper_unwrapped and target_video_id:
+                                self.logger.warning(
+                                    "yt-dlp title metadata returned playlist wrapper without matching entry submitted_url=%s normalized_url=%s target_video_id=%s",
+                                    url,
+                                    normalized_url,
+                                    target_video_id,
+                                )
+                            if isinstance(resolved_info, dict) and resolved_info.get("title"):
+                                return str(resolved_info["title"])
                     except Exception as exc:  # noqa: BLE001
                         last_error = str(exc)
                         self.logger.debug(
@@ -231,8 +257,10 @@ class AudioDownloader:
         """
 
         _ensure_runtime_path()
+        normalized_url = canonicalize_youtube_video_url(url)
+        target_video_id = extract_youtube_video_id(url)
         title = self._get_title(url)
-        sanitized = url.replace("https://", "").replace("http://", "")
+        sanitized = normalized_url.replace("https://", "").replace("http://", "")
         # Remove all invalid Windows filename characters: < > : " / \ | ? *
         invalid_chars = '<>:"/\\|?*'
         filename = sanitized
@@ -256,6 +284,7 @@ class AudioDownloader:
                 "-x",
                 "--audio-format",
                 "m4a",
+                "--no-playlist",
             ]
             base_common += _extra_cli_flags()
         else:
@@ -279,6 +308,7 @@ class AudioDownloader:
                 "-x",
                 "--audio-format",
                 "m4a",
+                "--no-playlist",
             ]
             base_common += _extra_cli_flags()
         attempt_matrix = []
@@ -288,16 +318,22 @@ class AudioDownloader:
 
         proxy_attempts = self.proxy_config.max_retries if self.proxy_config.enabled else 1
         proxy_attempts = max(1, proxy_attempts)
+        self.logger.info(
+            "yt-dlp download request submitted_url=%s normalized_url=%s target_video_id=%s noplaylist=true",
+            url,
+            normalized_url,
+            target_video_id or "unknown",
+        )
         last_error: Optional[str] = None
         for attempt_idx in range(proxy_attempts):
-            proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=url)
+            proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=normalized_url)
             proxy_slot = proxy_index(self.proxy_config, proxy_url)
             proxy_label = redact_proxy(proxy_url)
             rate_limited_this_round = False
 
             for extractor_arg, cookies_label, cookies_flags in attempt_matrix:
                 proxy_flags = ["--proxy", proxy_url] if proxy_url else []
-                attempt = base_common + ["--extractor-args", extractor_arg] + cookies_flags + proxy_flags + [url]
+                attempt = base_common + ["--extractor-args", extractor_arg] + cookies_flags + proxy_flags + [normalized_url]
                 self.logger.info(
                     "yt-dlp attempt extractor=%s cookies=%s egress=%s proxy_slot=%s attempt=%s/%s",
                     extractor_arg,

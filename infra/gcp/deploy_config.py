@@ -24,14 +24,22 @@ class DeployConfig:
     CLOUD_SQL_INSTANCE: Optional[str] = "capstone-sql"
     SQL_EDITION: str = "ENTERPRISE"
     SQL_TIER: str = "db-custom-2-7680"
+    SQL_STORAGE_TYPE: Optional[str] = None
     DB_NAME: Optional[str] = "capstone"
     DB_USER: Optional[str] = "capstone"
     DB_PASSWORD: Optional[str] = None
 
+    REDIS_RUNTIME: str = "memorystore"  # memorystore|worker_vm
     REDIS_INSTANCE: Optional[str] = "capstone-redis"
+    REDIS_VM_PORT: str = "6379"
+    REDIS_VM_REQUIREPASS: Optional[str] = None
+    REDIS_VM_FIREWALL_RULE: str = "capstone-worker-redis-allow"
+    REDIS_VM_ALLOWED_SOURCE: Optional[str] = None
     BUCKET_NAME: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
+    GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
     OPENAI_TRUST_ENV_PROXY: str = "false"
+    SUMMARIZER_MAX_TOKENS: str = "800"
 
     # Optional with defaults
     NETWORK: str = "default"
@@ -80,10 +88,6 @@ class DeployConfig:
     # Proxy egress controls (VM worker)
     PROXY_ENABLED: str = "false"
     PROXY_CAPTIONS_ONLY: str = "false"
-    HTTP_PROXY: Optional[str] = None
-    HTTPS_PROXY: Optional[str] = None
-    ALL_PROXY: Optional[str] = None
-    NO_PROXY: str = "169.254.169.254,metadata.google.internal,localhost,127.0.0.1"
     PROXY_ROTATION_MODE: str = "on_rate_limit"  # none|per_job|on_rate_limit
     PROXY_MAX_RETRIES: str = "3"
     PROXY_BACKOFF_SECONDS: str = "2"
@@ -118,16 +122,20 @@ CONFIG = DeployConfig(
     DB_PASSWORD="1e344de5940d4378ac21fc80ae03dccb",
     BUCKET_NAME="tribal-primer-438802-n0-capstone-artifacts",
     WORKER_RUNTIME="compute_engine",
-    SQL_TIER="db-custom-1-3840",
+    SQL_TIER="db-f1-micro",
     WORKER_VM_MACHINE_TYPE="e2-medium",
     OPENAI_API_KEY=None,  # uses backend/config.py fallback
+    SUMMARIZER_MAX_TOKENS="1500",
     YTDLP_COOKIES_FILE=None,
+    REDIS_RUNTIME="worker_vm",
+    REDIS_VM_REQUIREPASS="NWn6OP6zik6Jyi0uloVXVA3kbJJSiaVO",
     PROXY_ENABLED="true",
     PROXY_CAPTIONS_ONLY="true",
     PROXY_ROTATION_MODE="on_rate_limit",
     PROXY_MAX_RETRIES="3",
     PROXY_BACKOFF_SECONDS="2",
     PROXY_POOL="http://vucelhug-rotate:8bzu3fwqvpuy@p.webshare.io:80",
+    GOOGLE_OAUTH_CLIENT_ID="1075336295658-qcfbcm3v3nf35rgf00abdj8he3hcih0t.apps.googleusercontent.com",
 )
 
 def _fallback_openai_key() -> Optional[str]:
@@ -208,17 +216,6 @@ def _apply_proxy_env(values: dict[str, Optional[str]]) -> None:
     pool = _dedupe(pool)
     if pool:
         values["PROXY_POOL"] = ",".join(pool)
-        first = pool[0]
-        if not (values.get("HTTP_PROXY") or "").strip():
-            values["HTTP_PROXY"] = first
-        if not (values.get("HTTPS_PROXY") or "").strip():
-            values["HTTPS_PROXY"] = first
-        if not (values.get("ALL_PROXY") or "").strip():
-            values["ALL_PROXY"] = first
-
-    no_proxy = str(values.get("NO_PROXY") or "").strip()
-    if not no_proxy:
-        values["NO_PROXY"] = "169.254.169.254,metadata.google.internal,localhost,127.0.0.1"
 
 
 def get_deploy_env() -> dict[str, str]:

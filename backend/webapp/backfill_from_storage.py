@@ -6,6 +6,7 @@ from pathlib import Path
 
 from backend.vector_store import VectorStore
 
+from .config import settings
 from .db import SessionLocal
 from .metadata_store import MetadataStore
 from .migrate import run_migrations
@@ -15,6 +16,13 @@ from .object_store import get_object_store
 
 logger = logging.getLogger(__name__)
 PLACEHOLDER_PREFIX = "it seems that the transcript you intended to provide is missing"
+
+
+def _meta_bool(meta: dict, key: str, default: bool) -> bool:
+    value = meta.get(key, default)
+    if value is None:
+        return default
+    return bool(value)
 
 
 def _read_json(path: Path) -> dict:
@@ -59,12 +67,16 @@ def run(storage_root: Path = Path("storage")) -> None:
                 source_type = "youtube" if meta.get("youtube_url") else "upload"
                 job = JobRecord(
                     id=job_id,
+                    owner_email=(settings.legacy_jobs_owner_email or "danmcneary8@gmail.com").strip().lower(),
                     source_type=source_type,
                     source_url=meta.get("youtube_url"),
-                    prefer_youtube_captions=bool(meta.get("prefer_youtube_captions", True)),
+                    prefer_youtube_captions=_meta_bool(meta, "prefer_youtube_captions", True),
+                    allow_whisper_fallback=_meta_bool(meta, "allow_whisper_fallback", True),
                 )
                 db.add(job)
                 db.flush()
+            if not job.owner_email:
+                job.owner_email = (settings.legacy_jobs_owner_email or "danmcneary8@gmail.com").strip().lower()
 
             created_at_raw = meta.get("created_at")
             if created_at_raw:
@@ -77,6 +89,11 @@ def run(storage_root: Path = Path("storage")) -> None:
 
             job.status = meta.get("status", job.status or "complete")
             job.title = _read_text(title_path) or meta.get("title") or job.title
+            job.allow_whisper_fallback = _meta_bool(
+                meta,
+                "allow_whisper_fallback",
+                getattr(job, "allow_whisper_fallback", True),
+            )
             job.transcript_source = meta.get("transcript_source")
             job.captions_attempted = meta.get("captions_attempted")
             job.captions_status = meta.get("captions_status")

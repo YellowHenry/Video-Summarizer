@@ -16,10 +16,17 @@ class PresignUploadResponse(BaseModel):
     headers: dict = Field(default_factory=dict)
 
 
+class AuthMeResponse(BaseModel):
+    email: str
+    name: Optional[str] = None
+    picture: Optional[str] = None
+
+
 class CreateJobRequest(BaseModel):
     youtube_url: Optional[str] = None
     uploaded_object_key: Optional[str] = None
     prefer_youtube_captions: bool = True
+    allow_whisper_fallback: bool = True
 
 
 class CreateJobResponse(BaseModel):
@@ -41,6 +48,7 @@ class JobSummary(BaseModel):
 
 class JobDetail(JobSummary):
     prefer_youtube_captions: bool
+    allow_whisper_fallback: bool
     transcript_source: Optional[str] = None
     captions_attempted: Optional[bool] = None
     captions_status: Optional[str] = None

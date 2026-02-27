@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 
 test("submit job flow + persisted job chat rendering", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("audio_summarizer_auth_token", "test-token");
+  });
+
   const jobs: Array<{
     id: string;
     created_at: string;
@@ -11,6 +15,12 @@ test("submit job flow + persisted job chat rendering", async ({ page }) => {
     title: string | null;
   }> = [];
   const chats: Record<string, Array<{ id: number; role: "user" | "assistant"; content: string; created_at: string }>> = {};
+
+  await page.route("**/api/auth/me", async (route) => {
+    await route.fulfill({
+      json: { email: "e2e@example.com", name: "E2E User", picture: null }
+    });
+  });
 
   await page.route("**/api/jobs", async (route) => {
     const method = route.request().method();

@@ -6,6 +6,7 @@ import os
 from sqlalchemy import text
 
 from .db import engine, init_db
+from .config import settings
 
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,82 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ensure_allow_whisper_fallback_column(conn, dialect: str) -> None:
+    """Add jobs.allow_whisper_fallback for older deployments."""
+    try:
+        if dialect == "postgresql":
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS allow_whisper_fallback BOOLEAN DEFAULT TRUE"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE jobs
+                    SET allow_whisper_fallback = TRUE
+                    WHERE allow_whisper_fallback IS NULL
+                    """
+                )
+            )
+            return
+
+        if dialect == "sqlite":
+            rows = conn.execute(text("PRAGMA table_info(jobs)")).mappings().all()
+            column_names = {str(row.get("name")) for row in rows}
+            if "allow_whisper_fallback" not in column_names:
+                conn.execute(text("ALTER TABLE jobs ADD COLUMN allow_whisper_fallback BOOLEAN DEFAULT 1"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE jobs
+                    SET allow_whisper_fallback = 1
+                    WHERE allow_whisper_fallback IS NULL
+                    """
+                )
+            )
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to migrate jobs.allow_whisper_fallback column: %s", exc)
+
+
+def _ensure_owner_email_column(conn, dialect: str) -> None:
+    """Add jobs.owner_email and backfill legacy rows to configured owner email."""
+    owner_email = (settings.legacy_jobs_owner_email or "").strip().lower() or "danmcneary8@gmail.com"
+    try:
+        if dialect == "postgresql":
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS owner_email VARCHAR(320)"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE jobs
+                    SET owner_email = :owner_email
+                    WHERE owner_email IS NULL OR owner_email = ''
+                    """
+                ),
+                {"owner_email": owner_email},
+            )
+            conn.execute(text("ALTER TABLE jobs ALTER COLUMN owner_email SET NOT NULL"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_owner_email ON jobs(owner_email)"))
+            return
+
+        if dialect == "sqlite":
+            rows = conn.execute(text("PRAGMA table_info(jobs)")).mappings().all()
+            column_names = {str(row.get("name")) for row in rows}
+            if "owner_email" not in column_names:
+                conn.execute(text("ALTER TABLE jobs ADD COLUMN owner_email TEXT"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE jobs
+                    SET owner_email = :owner_email
+                    WHERE owner_email IS NULL OR owner_email = ''
+                    """
+                ),
+                {"owner_email": owner_email},
+            )
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_owner_email ON jobs(owner_email)"))
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to migrate jobs.owner_email column: %s", exc)
 
 
 def run_migrations() -> None:
@@ -29,6 +106,11 @@ def run_migrations() -> None:
         dialect = conn.dialect.name
         logger.info("Running migrations for dialect=%s", dialect)
 
+        _ensure_allow_whisper_fallback_column(conn, dialect)
+        _ensure_owner_email_column(conn, dialect)
+
+    with engine.begin() as conn:
+        dialect = conn.dialect.name
         if dialect != "postgresql":
             return
 

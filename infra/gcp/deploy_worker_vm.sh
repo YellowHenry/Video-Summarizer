@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/load_python_env.sh"
 
+gcloud() {
+  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy gcloud "$@"
+}
+
 resolve_openai_api_key() {
   if [[ -n "${OPENAI_API_KEY:-}" ]]; then
     return
@@ -27,13 +31,20 @@ resolve_openai_api_key
 : "${DB_NAME:?DB_NAME is required}"
 : "${DB_USER:?DB_USER is required}"
 : "${DB_PASSWORD:?DB_PASSWORD is required}"
-: "${REDIS_INSTANCE:?REDIS_INSTANCE is required}"
+: "${REDIS_RUNTIME:=memorystore}"
 : "${BUCKET_NAME:?BUCKET_NAME is required}"
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is required (or set backend/config.py OPENAI_API_KEY)}"
 : "${OPENAI_TRUST_ENV_PROXY:=false}"
+: "${SUMMARIZER_MAX_TOKENS:=800}"
 : "${WORKER_VM_NAME:=audio-summarizer-worker-vm}"
 : "${WORKER_VM_ZONE:=us-central1-a}"
 : "${WORKER_VM_USER:=worker}"
+: "${WORKER_VM_NETWORK:=default}"
+: "${VPC_CONNECTOR_RANGE:=10.8.0.0/28}"
+: "${REDIS_VM_PORT:=6379}"
+: "${REDIS_VM_REQUIREPASS:=}"
+: "${REDIS_VM_FIREWALL_RULE:=capstone-worker-redis-allow}"
+: "${REDIS_VM_ALLOWED_SOURCE:=}"
 : "${WORKER_SERVICE:=audio-summarizer-worker}"
 : "${DISABLE_CLOUD_RUN_WORKER:=true}"
 : "${CLOUD_RUN_SHADOW_QUEUE:=cloudrun-disabled}"
@@ -51,7 +62,6 @@ resolve_openai_api_key
 : "${PROXY_ROTATION_MODE:=on_rate_limit}"
 : "${PROXY_MAX_RETRIES:=3}"
 : "${PROXY_BACKOFF_SECONDS:=2}"
-: "${NO_PROXY:=169.254.169.254,metadata.google.internal,localhost,127.0.0.1}"
 : "${PROXY_POOL:=}"
 : "${PROXY_AUTOGENERATE:=false}"
 : "${PROXY_AUTOGENERATE_TEMPLATE:=}"
@@ -59,12 +69,14 @@ resolve_openai_api_key
 : "${PROXY_AUTOGENERATE_END:=1}"
 
 if [[ "${PROXY_ENABLED,,}" == "true" ]]; then
-  if [[ -z "${HTTP_PROXY:-}" && -z "${HTTPS_PROXY:-}" && -z "${ALL_PROXY:-}" && -z "${PROXY_POOL:-}" && ! ( "${PROXY_AUTOGENERATE,,}" == "true" && -n "${PROXY_AUTOGENERATE_TEMPLATE:-}" ) ]]; then
+  if [[ -z "${PROXY_POOL:-}" && ! ( "${PROXY_AUTOGENERATE,,}" == "true" && -n "${PROXY_AUTOGENERATE_TEMPLATE:-}" ) ]]; then
     echo "PROXY_ENABLED=true but no proxy endpoints were configured." >&2
-    echo "Set HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / PROXY_POOL, or set PROXY_AUTOGENERATE=true with PROXY_AUTOGENERATE_TEMPLATE." >&2
+    echo "Set PROXY_POOL, or set PROXY_AUTOGENERATE=true with PROXY_AUTOGENERATE_TEMPLATE." >&2
     exit 1
   fi
 fi
+
+gcloud config set project "${PROJECT_ID}" >/dev/null
 
 if ! gcloud compute instances describe "${WORKER_VM_NAME}" --zone "${WORKER_VM_ZONE}" >/dev/null 2>&1; then
   echo "Worker VM '${WORKER_VM_NAME}' not found in zone '${WORKER_VM_ZONE}'." >&2
@@ -73,7 +85,47 @@ if ! gcloud compute instances describe "${WORKER_VM_NAME}" --zone "${WORKER_VM_Z
 fi
 
 INSTANCE_CONN="${PROJECT_ID}:${REGION}:${CLOUD_SQL_INSTANCE}"
-REDIS_HOST="$(gcloud redis instances describe "${REDIS_INSTANCE}" --region "${REGION}" --format='value(host)')"
+WORKER_VM_INTERNAL_IP="$(gcloud compute instances describe "${WORKER_VM_NAME}" --zone "${WORKER_VM_ZONE}" --format='value(networkInterfaces[0].networkIP)')"
+REDIS_URL="redis://localhost:6379/0"
+REDIS_CONF_FILE=""
+REMOTE_REDIS_CONF="/tmp/capstone-redis.conf"
+
+if [[ "${REDIS_RUNTIME}" == "worker_vm" ]]; then
+  : "${REDIS_VM_REQUIREPASS:?REDIS_VM_REQUIREPASS is required when REDIS_RUNTIME=worker_vm}"
+  if [[ -z "${REDIS_VM_ALLOWED_SOURCE}" ]]; then
+    REDIS_VM_ALLOWED_SOURCE="${VPC_CONNECTOR_RANGE}"
+  fi
+  if gcloud compute firewall-rules describe "${REDIS_VM_FIREWALL_RULE}" >/dev/null 2>&1; then
+    gcloud compute firewall-rules update "${REDIS_VM_FIREWALL_RULE}" \
+      --source-ranges="${REDIS_VM_ALLOWED_SOURCE}" \
+      --target-tags="capstone-worker-vm" \
+      >/dev/null
+  else
+    gcloud compute firewall-rules create "${REDIS_VM_FIREWALL_RULE}" \
+      --direction=INGRESS \
+      --network="${WORKER_VM_NETWORK}" \
+      --action=ALLOW \
+      --rules="tcp:${REDIS_VM_PORT}" \
+      --source-ranges="${REDIS_VM_ALLOWED_SOURCE}" \
+      --target-tags="capstone-worker-vm" \
+      >/dev/null
+  fi
+  REDIS_URL="redis://:${REDIS_VM_REQUIREPASS}@127.0.0.1:${REDIS_VM_PORT}/0"
+  REDIS_CONF_FILE="$(mktemp /tmp/capstone-worker-redis.XXXXXX.conf)"
+  cat >"${REDIS_CONF_FILE}" <<EOF
+# Managed by infra/gcp/deploy_worker_vm.sh
+bind 127.0.0.1 ${WORKER_VM_INTERNAL_IP}
+protected-mode yes
+port ${REDIS_VM_PORT}
+requirepass ${REDIS_VM_REQUIREPASS}
+appendonly yes
+maxmemory-policy noeviction
+EOF
+else
+  : "${REDIS_INSTANCE:?REDIS_INSTANCE is required when REDIS_RUNTIME=${REDIS_RUNTIME}}"
+  REDIS_HOST="$(gcloud redis instances describe "${REDIS_INSTANCE}" --region "${REGION}" --format='value(host)')"
+  REDIS_URL="redis://${REDIS_HOST}:6379/0"
+fi
 
 SRC_TAR="$(mktemp /tmp/capstone-worker-src.XXXXXX.tgz)"
 ENV_FILE="$(mktemp /tmp/capstone-worker-env.XXXXXX)"
@@ -82,6 +134,9 @@ REMOTE_ENV="/tmp/capstone-worker.env"
 
 cleanup() {
   rm -f "${SRC_TAR}" "${ENV_FILE}" >/dev/null 2>&1 || true
+  if [[ -n "${REDIS_CONF_FILE}" ]]; then
+    rm -f "${REDIS_CONF_FILE}" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -97,11 +152,12 @@ tar \
 cat >"${ENV_FILE}" <<EOF
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASSWORD}@/${DB_NAME}?host=/cloudsql/${INSTANCE_CONN}
-REDIS_URL=redis://${REDIS_HOST}:6379/0
+REDIS_URL=${REDIS_URL}
 OBJECT_STORAGE_BACKEND=gcs
 GCS_BUCKET=${BUCKET_NAME}
 OPENAI_API_KEY=${OPENAI_API_KEY}
 OPENAI_TRUST_ENV_PROXY=${OPENAI_TRUST_ENV_PROXY}
+SUMMARIZER_MAX_TOKENS=${SUMMARIZER_MAX_TOKENS}
 RQ_QUEUE_NAME=jobs
 RQ_RETRY_MAX=${RQ_RETRY_MAX}
 RQ_RETRY_INTERVALS=${RQ_RETRY_INTERVALS}
@@ -117,7 +173,6 @@ PROXY_CAPTIONS_ONLY=${PROXY_CAPTIONS_ONLY}
 PROXY_ROTATION_MODE=${PROXY_ROTATION_MODE}
 PROXY_MAX_RETRIES=${PROXY_MAX_RETRIES}
 PROXY_BACKOFF_SECONDS=${PROXY_BACKOFF_SECONDS}
-NO_PROXY=${NO_PROXY}
 PROXY_AUTOGENERATE=${PROXY_AUTOGENERATE}
 PROXY_AUTOGENERATE_TEMPLATE=${PROXY_AUTOGENERATE_TEMPLATE}
 PROXY_AUTOGENERATE_START=${PROXY_AUTOGENERATE_START}
@@ -134,15 +189,10 @@ if [[ -n "${YTDLP_COOKIES_B64:-}" ]]; then
   echo "YTDLP_COOKIES_B64=${YTDLP_COOKIES_B64}" >>"${ENV_FILE}"
 fi
 if [[ "${PROXY_ENABLED,,}" == "true" ]]; then
-  if [[ -n "${HTTP_PROXY:-}" ]]; then
-    echo "HTTP_PROXY=${HTTP_PROXY}" >>"${ENV_FILE}"
-  fi
-  if [[ -n "${HTTPS_PROXY:-}" ]]; then
-    echo "HTTPS_PROXY=${HTTPS_PROXY}" >>"${ENV_FILE}"
-  fi
-  if [[ -n "${ALL_PROXY:-}" ]]; then
-    echo "ALL_PROXY=${ALL_PROXY}" >>"${ENV_FILE}"
-  fi
+  # Intentionally do NOT export global HTTP(S)_PROXY / ALL_PROXY into the worker runtime.
+  # The app routes caption traffic through proxies explicitly via backend/proxy_egress.py.
+  # Keeping global proxy env vars out of worker.env prevents non-caption traffic
+  # (for example GCS uploads, metadata calls) from being sent through residential proxies.
   if [[ -n "${PROXY_POOL:-}" ]]; then
     echo "PROXY_POOL=${PROXY_POOL}" >>"${ENV_FILE}"
   fi
@@ -150,6 +200,9 @@ fi
 
 gcloud compute scp "${SRC_TAR}" "${WORKER_VM_NAME}:${REMOTE_TAR}" --zone "${WORKER_VM_ZONE}" >/dev/null
 gcloud compute scp "${ENV_FILE}" "${WORKER_VM_NAME}:${REMOTE_ENV}" --zone "${WORKER_VM_ZONE}" >/dev/null
+if [[ "${REDIS_RUNTIME}" == "worker_vm" ]]; then
+  gcloud compute scp "${REDIS_CONF_FILE}" "${WORKER_VM_NAME}:${REMOTE_REDIS_CONF}" --zone "${WORKER_VM_ZONE}" >/dev/null
+fi
 
 gcloud compute ssh "${WORKER_VM_NAME}" --zone "${WORKER_VM_ZONE}" --command "
 set -euo pipefail
@@ -164,17 +217,36 @@ fi
 sudo -u ${WORKER_VM_USER} python3 -m venv /opt/capstone/.venv
 sudo -u ${WORKER_VM_USER} /opt/capstone/.venv/bin/pip install --upgrade pip >/dev/null
 sudo -u ${WORKER_VM_USER} /opt/capstone/.venv/bin/pip install -r /opt/capstone/requirements.txt >/dev/null
+if [[ \"${REDIS_RUNTIME}\" == \"worker_vm\" ]]; then
+  if ! command -v redis-server >/dev/null 2>&1; then
+    sudo apt-get update >/dev/null
+    sudo apt-get install -y redis-server >/dev/null
+  fi
+  if ! sudo grep -Fq 'include /etc/redis/redis-capstone.conf' /etc/redis/redis.conf; then
+    echo 'include /etc/redis/redis-capstone.conf' | sudo tee -a /etc/redis/redis.conf >/dev/null
+  fi
+  sudo mv ${REMOTE_REDIS_CONF} /etc/redis/redis-capstone.conf
+  sudo chown root:redis /etc/redis/redis-capstone.conf || sudo chown root:root /etc/redis/redis-capstone.conf
+  sudo chmod 640 /etc/redis/redis-capstone.conf
+  sudo systemctl enable redis-server >/dev/null
+  sudo systemctl restart redis-server
+fi
 sudo mv ${REMOTE_ENV} /etc/capstone/worker.env
 sudo chown root:root /etc/capstone/worker.env
 sudo chmod 600 /etc/capstone/worker.env
 sudo systemctl daemon-reload
 sudo systemctl enable cloud-sql-proxy capstone-worker >/dev/null
+sudo mkdir -p /cloudsql/${INSTANCE_CONN}
+sudo rm -f /cloudsql/${INSTANCE_CONN}/.s.PGSQL.5432 /cloudsql/${INSTANCE_CONN}/.s.PGSQL.5432.lock >/dev/null 2>&1 || true
 sudo systemctl restart cloud-sql-proxy
 sudo systemctl restart capstone-worker
 sudo systemctl --no-pager --full status capstone-worker | head -n 30
 " >/dev/null
 
 echo "VM worker deployed on ${WORKER_VM_NAME} (${WORKER_VM_ZONE})."
+if [[ "${REDIS_RUNTIME}" == "worker_vm" ]]; then
+  echo "VM Redis configured on ${WORKER_VM_NAME}:${REDIS_VM_PORT} (firewall source ${REDIS_VM_ALLOWED_SOURCE})."
+fi
 
 if [[ "${DISABLE_CLOUD_RUN_WORKER,,}" == "true" ]]; then
   if gcloud run services describe "${WORKER_SERVICE}" --project "${PROJECT_ID}" --region "${REGION}" >/dev/null 2>&1; then

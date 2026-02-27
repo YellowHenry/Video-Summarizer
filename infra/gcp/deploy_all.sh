@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/load_python_env.sh"
 
+gcloud() {
+  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy gcloud "$@"
+}
+
 resolve_openai_api_key() {
   if [[ -n "${OPENAI_API_KEY:-}" ]]; then
     return
@@ -123,9 +127,13 @@ resolve_openai_api_key
 : "${DB_NAME:?DB_NAME is required}"
 : "${DB_USER:?DB_USER is required}"
 : "${DB_PASSWORD:?DB_PASSWORD is required}"
-: "${REDIS_INSTANCE:?REDIS_INSTANCE is required}"
+: "${REDIS_RUNTIME:=memorystore}"
 : "${BUCKET_NAME:?BUCKET_NAME is required}"
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is required (or set backend/config.py OPENAI_API_KEY)}"
+
+if [[ "${REDIS_RUNTIME}" != "worker_vm" ]]; then
+  : "${REDIS_INSTANCE:?REDIS_INSTANCE is required when REDIS_RUNTIME=${REDIS_RUNTIME}}"
+fi
 
 if [[ "${WORKER_RUNTIME}" != "compute_engine" ]]; then
   echo "WORKER_RUNTIME=${WORKER_RUNTIME} is not supported by this repo anymore." >&2

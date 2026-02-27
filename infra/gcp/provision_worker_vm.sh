@@ -5,10 +5,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/load_python_env.sh"
 
+gcloud() {
+  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy gcloud "$@"
+}
+
 : "${PROJECT_ID:?PROJECT_ID is required}"
 : "${REGION:?REGION is required}"
 : "${CLOUD_SQL_INSTANCE:?CLOUD_SQL_INSTANCE is required}"
 : "${BUCKET_NAME:?BUCKET_NAME is required}"
+: "${REDIS_RUNTIME:=memorystore}"
+: "${REDIS_VM_PORT:=6379}"
+: "${REDIS_VM_FIREWALL_RULE:=capstone-worker-redis-allow}"
+: "${REDIS_VM_ALLOWED_SOURCE:=}"
 : "${WORKER_VM_NAME:=audio-summarizer-worker-vm}"
 : "${WORKER_VM_ZONE:=us-central1-a}"
 : "${WORKER_VM_MACHINE_TYPE:=e2-standard-2}"
@@ -16,6 +24,7 @@ source "${SCRIPT_DIR}/load_python_env.sh"
 : "${WORKER_VM_IMAGE_FAMILY:=debian-12}"
 : "${WORKER_VM_IMAGE_PROJECT:=debian-cloud}"
 : "${WORKER_VM_NETWORK:=default}"
+: "${VPC_CONNECTOR_RANGE:=10.8.0.0/28}"
 : "${WORKER_VM_SUBNET:=}"
 : "${WORKER_VM_ENABLE_RDP:=true}"
 : "${WORKER_VM_RDP_SOURCE:=0.0.0.0/0}"
@@ -76,6 +85,27 @@ if [[ "${WORKER_VM_ENABLE_RDP,,}" == "true" ]]; then
   fi
 fi
 
+if [[ "${REDIS_RUNTIME}" == "worker_vm" ]]; then
+  if [[ -z "${REDIS_VM_ALLOWED_SOURCE}" ]]; then
+    REDIS_VM_ALLOWED_SOURCE="${VPC_CONNECTOR_RANGE}"
+  fi
+  if ! gcloud compute firewall-rules describe "${REDIS_VM_FIREWALL_RULE}" >/dev/null 2>&1; then
+    gcloud compute firewall-rules create "${REDIS_VM_FIREWALL_RULE}" \
+      --direction=INGRESS \
+      --network="${WORKER_VM_NETWORK}" \
+      --action=ALLOW \
+      --rules="tcp:${REDIS_VM_PORT}" \
+      --source-ranges="${REDIS_VM_ALLOWED_SOURCE}" \
+      --target-tags=capstone-worker-vm \
+      >/dev/null
+  else
+    gcloud compute firewall-rules update "${REDIS_VM_FIREWALL_RULE}" \
+      --source-ranges="${REDIS_VM_ALLOWED_SOURCE}" \
+      --target-tags=capstone-worker-vm \
+      >/dev/null
+  fi
+fi
+
 cat > "${STARTUP_SCRIPT}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -86,6 +116,7 @@ apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg lsb-release wget \
   python3 python3-venv python3-pip \
   ffmpeg git jq \
+  redis-server \
   xrdp xfce4 xfce4-goodies dbus-x11 xorgxrdp
 
 if ! command -v google-chrome >/dev/null 2>&1; then
@@ -112,6 +143,11 @@ fi
 
 mkdir -p /opt/capstone /etc/capstone /cloudsql
 chown -R ${WORKER_VM_USER}:${WORKER_VM_USER} /opt/capstone /cloudsql /home/${WORKER_VM_USER}
+
+touch /etc/redis/redis-capstone.conf
+if ! grep -Fq 'include /etc/redis/redis-capstone.conf' /etc/redis/redis.conf; then
+  echo 'include /etc/redis/redis-capstone.conf' >> /etc/redis/redis.conf
+fi
 
 echo "startxfce4" > /home/${WORKER_VM_USER}/.xsession
 chown ${WORKER_VM_USER}:${WORKER_VM_USER} /home/${WORKER_VM_USER}/.xsession
@@ -159,6 +195,8 @@ SYSTEMD
 systemctl daemon-reload
 systemctl enable xrdp || true
 systemctl restart xrdp || true
+systemctl enable redis-server || true
+systemctl restart redis-server || true
 systemctl enable cloud-sql-proxy capstone-worker
 systemctl restart cloud-sql-proxy || true
 systemctl restart capstone-worker || true

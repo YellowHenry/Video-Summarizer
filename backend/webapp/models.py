@@ -17,6 +17,7 @@ class JobRecord(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, index=True)
+    owner_email: Mapped[str] = mapped_column(String(320), index=True, nullable=False)
 
     status: Mapped[str] = mapped_column(String(32), default="queued")
     source_type: Mapped[str] = mapped_column(String(16), default="upload")  # upload|youtube
@@ -25,6 +26,7 @@ class JobRecord(Base):
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     prefer_youtube_captions: Mapped[bool] = mapped_column(Boolean, default=True)
+    allow_whisper_fallback: Mapped[bool] = mapped_column(Boolean, default=True)
     transcript_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     captions_attempted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     captions_status: Mapped[str | None] = mapped_column(String(128), nullable=True)

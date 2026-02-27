@@ -23,6 +23,11 @@ from .proxy_egress import (
     select_proxy_for_attempt,
     sleep_backoff,
 )
+from .youtube_url import (
+    canonicalize_youtube_video_url,
+    extract_youtube_video_id as parse_youtube_video_id,
+    unwrap_ytdlp_video_info,
+)
 from .ytdlp_cookies import resolve_cookies_file
 
 try:
@@ -83,6 +88,9 @@ class SummarizerConfig:
     api_version: Optional[str] = os.getenv("AZURE_OPENAI_API_VERSION")
     ffmpeg_path: Optional[str] = os.getenv("FFMPEG_PATH")
     max_tokens: int = int(os.getenv("SUMMARIZER_MAX_TOKENS", "800"))
+    job_chat_max_tokens: int = int(os.getenv("JOB_CHAT_MAX_TOKENS", "1500"))
+    job_chat_auto_continue_enabled: bool = _env_bool("JOB_CHAT_AUTO_CONTINUE_ENABLED", True)
+    job_chat_auto_continue_max_segments: int = int(os.getenv("JOB_CHAT_AUTO_CONTINUE_MAX_SEGMENTS", "4"))
     chunk_duration_seconds: int = int(os.getenv("SUMMARIZER_CHUNK_SECONDS", str(42 * 60)))  # default 42 minutes
     whisper_upload_limit_bytes: int = int(os.getenv("SUMMARIZER_WHISPER_LIMIT_BYTES", str(25 * 1024 * 1024)))
     openai_trust_env_proxy: bool = _env_bool("OPENAI_TRUST_ENV_PROXY", False)
@@ -118,14 +126,10 @@ class CloudSummarizerClient:
                 client_kwargs["http_client"] = DefaultHttpxClient(timeout=self.config.timeout, trust_env=False)
             self.client = OpenAI(**client_kwargs)
 
-        proxy_env_set = any((os.getenv(name) or "").strip() for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"))
-        if self.client and proxy_env_set:
-            if self.config.openai_trust_env_proxy:
-                self.logger.warning(
-                    "OPENAI_TRUST_ENV_PROXY=true; OpenAI requests will use HTTP(S)_PROXY/ALL_PROXY environment settings."
-                )
-            else:
-                self.logger.info("OpenAI client configured with trust_env=False; ignoring HTTP(S)_PROXY/ALL_PROXY env vars.")
+        if self.client and self.config.openai_trust_env_proxy:
+            self.logger.warning(
+                "OPENAI_TRUST_ENV_PROXY=true; OpenAI requests may use environment proxy settings."
+            )
 
     def _transcode_to_wav_retry(self, source: Path) -> Optional[Path]:
         """Create a retry-friendly WAV for Whisper when compressed input is rejected."""
@@ -197,26 +201,7 @@ class CloudSummarizerClient:
         return HARDCODED_COOKIES_FROM_BROWSER
 
     def _extract_youtube_video_id(self, url: str) -> Optional[str]:
-        try:
-            parsed = urlparse(url)
-        except Exception:  # noqa: BLE001
-            return None
-
-        host = (parsed.netloc or "").lower()
-        if "youtu.be" in host:
-            candidate = parsed.path.strip("/")
-            return candidate or None
-
-        if "youtube.com" in host or "music.youtube.com" in host:
-            query = parse_qs(parsed.query)
-            candidate = (query.get("v") or [None])[0]
-            if candidate:
-                return candidate
-            # /shorts/<id> or /embed/<id>
-            parts = [part for part in parsed.path.split("/") if part]
-            if len(parts) >= 2 and parts[0] in {"shorts", "embed"}:
-                return parts[1]
-        return None
+        return parse_youtube_video_id(url)
 
     def _fetch_youtube_captions_via_transcript_api(
         self, url: str
@@ -741,6 +726,8 @@ class CloudSummarizerClient:
         where transcript_source is one of "youtube_subtitles" or "youtube_auto_captions" on success.
         """
         transcript_api_result: Optional[tuple[Optional[str], Optional[str], str, Optional[str]]] = None
+        target_video_id = self._extract_youtube_video_id(url)
+        normalized_url = canonicalize_youtube_video_url(url)
 
         def _maybe_try_transcript_api() -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
             nonlocal transcript_api_result
@@ -773,7 +760,13 @@ class CloudSummarizerClient:
             "youtube:player_client=web_remix",
             "youtube:player_client=default",
         ]
-        ydl_opts_base = {"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": False}
+        ydl_opts_base = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": False,
+            "noplaylist": True,
+        }
         browser_cookie = self._resolve_caption_cookie_source()
         cookie_file = resolve_cookies_file()
         cookie_attempts: list[tuple[str, Optional[str]]] = []
@@ -811,7 +804,7 @@ class CloudSummarizerClient:
         last_detail: Optional[str] = None
 
         for attempt_idx in range(attempts):
-            proxy_url = select_proxy_for_attempt(proxy_config, attempt_idx, stable_key=url)
+            proxy_url = select_proxy_for_attempt(proxy_config, attempt_idx, stable_key=normalized_url)
             proxy_slot = proxy_index(proxy_config, proxy_url)
             proxy_label = redact_proxy(proxy_url)
             req_proxies = build_requests_proxies(proxy_url)
@@ -856,7 +849,7 @@ class CloudSummarizerClient:
                             attempts,
                         )
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            info = ydl.extract_info(url, download=False)
+                            info = ydl.extract_info(normalized_url, download=False)
                         if info:
                             break
                     except Exception as inner_exc:  # noqa: BLE001
@@ -888,8 +881,30 @@ class CloudSummarizerClient:
                     continue
                 break
 
-            subtitles = (info or {}).get("subtitles") or {}
-            auto_captions = (info or {}).get("automatic_captions") or {}
+            wrapper_detected = isinstance(info, dict) and info.get("entries") is not None
+            resolved_info = unwrap_ytdlp_video_info(info, target_video_id)
+            wrapper_unwrapped = wrapper_detected and resolved_info is not info
+            info_for_captions = resolved_info if isinstance(resolved_info, dict) else (info if isinstance(info, dict) else {})
+            subtitles = (info_for_captions or {}).get("subtitles") or {}
+            auto_captions = (info_for_captions or {}).get("automatic_captions") or {}
+            self.logger.info(
+                "yt-dlp captions metadata submitted_url=%s normalized_url=%s noplaylist=true target_video_id=%s yt_info_type=%s yt_info_id=%s wrapper_unwrapped=%s subtitles_lang_count=%s auto_captions_lang_count=%s",
+                url,
+                normalized_url,
+                target_video_id or "unknown",
+                "playlist_wrapper" if wrapper_detected else "video",
+                str(info_for_captions.get("id") or "unknown"),
+                str(bool(wrapper_unwrapped)).lower(),
+                len(subtitles),
+                len(auto_captions),
+            )
+            if wrapper_detected and not wrapper_unwrapped and target_video_id:
+                self.logger.warning(
+                    "yt-dlp captions metadata returned playlist wrapper without matching entry submitted_url=%s normalized_url=%s target_video_id=%s",
+                    url,
+                    normalized_url,
+                    target_video_id,
+                )
             retryable_fetch = False
             for source_name, captions_map in (("youtube_subtitles", subtitles), ("youtube_auto_captions", auto_captions)):
                 candidates = []
@@ -964,7 +979,13 @@ class CloudSummarizerClient:
                 continue
 
             last_status = "no_en_captions"
-            last_detail = "No English captions found in subtitles/automatic_captions"
+            if wrapper_detected:
+                last_detail = (
+                    "No English captions found in subtitles/automatic_captions "
+                    f"(wrapper_result_detected=true, wrapper_unwrapped={str(bool(wrapper_unwrapped)).lower()})"
+                )
+            else:
+                last_detail = "No English captions found in subtitles/automatic_captions"
             break
 
         text, source, status, transcript_detail = _maybe_try_transcript_api()

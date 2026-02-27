@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Set
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, or_, select, text
 from sqlalchemy.orm import Session
 
 from backend.vector_store import VectorRecord
@@ -20,6 +20,7 @@ class NewJobParams:
     source_url: Optional[str]
     uploaded_object_key: Optional[str]
     prefer_youtube_captions: bool
+    allow_whisper_fallback: bool
 
 
 class MetadataStore:
@@ -32,12 +33,14 @@ class MetadataStore:
         self.logger = logging.getLogger(__name__)
         self._has_pgvector_column_cache: Optional[bool] = None
 
-    def create_job(self, params: NewJobParams) -> JobRecord:
+    def create_job(self, params: NewJobParams, owner_email: str) -> JobRecord:
         job = JobRecord(
+            owner_email=owner_email.strip().lower(),
             source_type=params.source_type,
             source_url=params.source_url,
             uploaded_object_key=params.uploaded_object_key,
             prefer_youtube_captions=params.prefer_youtube_captions,
+            allow_whisper_fallback=params.allow_whisper_fallback,
             status="queued",
         )
         self.session.add(job)
@@ -45,11 +48,32 @@ class MetadataStore:
         self.session.refresh(job)
         return job
 
-    def get_job(self, job_id: str) -> JobRecord | None:
-        return self.session.get(JobRecord, job_id)
+    def get_job(self, job_id: str, owner_email: str | None = None) -> JobRecord | None:
+        if owner_email is None:
+            return self.session.get(JobRecord, job_id)
+        return (
+            self.session.execute(
+                select(JobRecord).where(
+                    JobRecord.id == job_id,
+                    JobRecord.owner_email == owner_email.strip().lower(),
+                )
+            )
+            .scalars()
+            .first()
+        )
 
-    def list_jobs(self) -> list[JobRecord]:
-        return self.session.execute(select(JobRecord).order_by(JobRecord.created_at.desc())).scalars().all()
+    def list_jobs(self, owner_email: str | None = None) -> list[JobRecord]:
+        stmt = select(JobRecord)
+        if owner_email is not None:
+            stmt = stmt.where(JobRecord.owner_email == owner_email.strip().lower())
+        stmt = stmt.order_by(JobRecord.created_at.desc())
+        return self.session.execute(stmt).scalars().all()
+
+    def list_job_ids(self, owner_email: str) -> set[str]:
+        rows = self.session.execute(
+            select(JobRecord.id).where(JobRecord.owner_email == owner_email.strip().lower())
+        ).all()
+        return {str(row[0]) for row in rows}
 
     def update_job(self, job: JobRecord, **fields) -> JobRecord:
         for key, value in fields.items():
@@ -314,3 +338,36 @@ class MetadataStore:
     def _vector_literal(values: list[float]) -> str:
         # pgvector text input format: [1,2,3]
         return "[" + ",".join(f"{value:.8f}" for value in values) + "]"
+
+    def has_object_access(self, object_key: str, owner_email: str) -> bool:
+        normalized_owner = owner_email.strip().lower()
+        has_job_object = (
+            self.session.execute(
+                select(JobRecord.id).where(
+                    JobRecord.owner_email == normalized_owner,
+                    or_(
+                        JobRecord.summary_object_key == object_key,
+                        JobRecord.transcript_object_key == object_key,
+                        JobRecord.uploaded_object_key == object_key,
+                    ),
+                )
+            )
+            .first()
+            is not None
+        )
+        if has_job_object:
+            return True
+
+        has_artifact = (
+            self.session.execute(
+                select(JobArtifact.id)
+                .join(JobRecord, JobArtifact.job_id == JobRecord.id)
+                .where(
+                    JobArtifact.object_key == object_key,
+                    JobRecord.owner_email == normalized_owner,
+                )
+            )
+            .first()
+            is not None
+        )
+        return has_artifact

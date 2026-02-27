@@ -106,9 +106,6 @@ def load_proxy_egress_config(purpose: str | None = None) -> ProxyEgressConfig:
 
     candidates = pool + [
         (os.getenv("YTDLP_PROXY") or "").strip(),
-        (os.getenv("ALL_PROXY") or "").strip(),
-        (os.getenv("HTTPS_PROXY") or "").strip(),
-        (os.getenv("HTTP_PROXY") or "").strip(),
     ]
     proxies = tuple(_dedupe([value for value in candidates if value]))
 

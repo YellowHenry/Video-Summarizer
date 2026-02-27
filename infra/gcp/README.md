@@ -1,11 +1,11 @@
-# GCP Deployment (Cloud Run + Cloud SQL + Redis + GCS)
+# GCP Deployment (Cloud Run + Cloud SQL + Redis/GCS)
 
 This folder contains deployment scripts for the web migration stack:
 - API service on Cloud Run
 - Worker service on persistent Compute Engine VM
 - Optional web frontend service on Cloud Run
 - Cloud SQL Postgres
-- Memorystore Redis
+- Redis queue (Memorystore or Redis on the worker VM)
 - GCS artifact bucket
 - Optional Cloud Run domain mapping (managed HTTPS)
 
@@ -15,7 +15,7 @@ This folder contains deployment scripts for the web migration stack:
 - `docker` installed (for image builds in these scripts)
 - `bash` shell available (`Git Bash` or `WSL`) for `.sh` scripts
 - Billing enabled
-- A project with permissions to create Cloud Run, Cloud SQL, Redis, GCS, IAM resources
+- A project with permissions to create Cloud Run, Cloud SQL, GCS, IAM resources (and Redis resources if using `REDIS_RUNTIME=memorystore`)
 - OpenAI API key
 - Optional for cloud backfill from local storage: `cloud-sql-proxy`
 
@@ -213,6 +213,7 @@ Edit `infra/gcp/deploy_config.py` and set the required fields:
 - `REPO`
 - `DB_PASSWORD`
 - `BUCKET_NAME`
+- `GOOGLE_OAUTH_CLIENT_ID`
 - `OPENAI_API_KEY` (or keep this unset and rely on `backend/config.py` key)
 
 You can keep defaults for most other fields (`REGION`, image names, service names, etc.) unless you want custom names.
@@ -256,6 +257,13 @@ your-project-id-capstone-artifacts
 - Option B: leave it unset here and put it in `backend/config.py` (`OPENAI_API_KEY`).
 - Option C: export `OPENAI_API_KEY` in shell for a one-off override.
 
+6. `GOOGLE_OAUTH_CLIENT_ID`
+- Create a Google OAuth Web Client in Google Cloud Console.
+- Add your web app origin(s) (for example Cloud Run web URL and local `http://localhost:5173`) under Authorized JavaScript origins.
+- Set the resulting client ID here so:
+  - frontend gets `VITE_GOOGLE_CLIENT_ID`
+  - backend verifies bearer ID tokens using `WEBAPP_GOOGLE_CLIENT_ID`
+
 ### Minimal safe config to paste
 
 ```python
@@ -265,6 +273,7 @@ CONFIG = DeployConfig(
     REPO="capstone-repo",
     DB_PASSWORD="1e344de5940d4378ac21fc80ae03dccb",
     BUCKET_NAME="video-summarizer-487915-capstone-artifacts",
+    GOOGLE_OAUTH_CLIENT_ID="your-google-oauth-client-id.apps.googleusercontent.com",
     OPENAI_API_KEY=None,  # uses backend/config.py fallback
 )
 ```
@@ -362,7 +371,15 @@ export NETWORK="default"
 export VPC_CONNECTOR="capstone-connector"
 export VPC_CONNECTOR_RANGE="10.8.0.0/28"
 export SQL_EDITION="ENTERPRISE"
-export SQL_TIER="db-custom-2-7680"
+export SQL_TIER="db-f1-micro"     # cost-optimized target for low traffic
+# export SQL_STORAGE_TYPE="PD_HDD" # optional extra savings (if acceptable / supported)
+
+export REDIS_RUNTIME="worker_vm"  # memorystore|worker_vm
+export REDIS_INSTANCE="capstone-redis"  # used when REDIS_RUNTIME=memorystore
+export REDIS_VM_PORT="6379"
+# export REDIS_VM_REQUIREPASS="replace-me-with-random-password"
+export REDIS_VM_FIREWALL_RULE="capstone-worker-redis-allow"
+# export REDIS_VM_ALLOWED_SOURCE="10.8.0.0/28"  # defaults to VPC_CONNECTOR_RANGE
 
 export API_SERVICE="audio-summarizer-api"
 export WORKER_SERVICE="audio-summarizer-worker"
@@ -416,7 +433,7 @@ Then rerun deploy.
 - Enables required APIs
 - Creates Artifact Registry repo
 - Creates Cloud SQL instance/database/user
-- Creates Redis instance
+- Creates Redis instance only when `REDIS_RUNTIME=memorystore`
 - Creates GCS bucket
 - Creates Serverless VPC connector (Cloud Run -> Redis connectivity)
 - Creates API/worker service accounts
@@ -435,6 +452,8 @@ Then rerun deploy.
 - Builds/pushes API image by default, then deploys API Cloud Run service
 - Attaches Cloud SQL and VPC connector
 - Sets Redis/GCS/OpenAI env vars
+  - `REDIS_RUNTIME=memorystore`: API uses Memorystore host
+  - `REDIS_RUNTIME=worker_vm`: API uses worker VM internal IP + `REDIS_VM_REQUIREPASS`
 - Sets `API_BASE_URL` automatically to deployed service URL
 - Skip image build/push only if needed:
 ```bash
@@ -445,20 +464,32 @@ BUILD_AND_PUSH_API=false bash infra/gcp/deploy_api.sh
 - Provisions/updates a persistent Compute Engine VM for worker runtime
 - Installs:
   - Python + ffmpeg
+  - `redis-server` (for `REDIS_RUNTIME=worker_vm`)
   - Cloud SQL Auth Proxy
   - Google Chrome
   - XFCE + XRDP (for one-time browser login)
 - Creates/updates systemd units:
   - `cloud-sql-proxy`
   - `capstone-worker`
+- In `REDIS_RUNTIME=worker_vm` mode, also prepares a firewall rule allowing Redis only from the VPC connector CIDR
 - Creates a VM service account and grants least-privilege roles
 
 ### `deploy_worker_vm.sh`
 - Syncs worker source code (`backend/` + `requirements.txt`) to VM
 - Creates/updates virtualenv and installs requirements
 - Writes `/etc/capstone/worker.env`
+- In `REDIS_RUNTIME=worker_vm` mode:
+  - writes `/etc/redis/redis-capstone.conf` (bind local + VM internal IP, `requirepass`, AOF, `noeviction`)
+  - restarts `redis-server`
+  - updates Redis firewall rule source range (defaults to `VPC_CONNECTOR_RANGE`)
 - Restarts `cloud-sql-proxy` and `capstone-worker`
 - Also disables any legacy Cloud Run worker service by scaling to `min-instances=0` and moving it to a shadow queue (`RQ_QUEUE_NAME=cloudrun-disabled`)
+
+### `rightsize_online_costs.sh`
+- Cost-optimization helper for Cloud SQL when you want the app to stay online
+- Patches Cloud SQL tier to `SQL_TIER` (recommended target: `db-f1-micro`)
+- If primary tier fails, automatically retries fallback `db-g1-small`
+- Optionally applies `SQL_STORAGE_TYPE` if set
 
 ### `provision_worker_vm.ps1` / `deploy_worker_vm.ps1`
 - PowerShell wrappers for Windows that run the corresponding `.sh` scripts
@@ -493,14 +524,13 @@ error getting credentials - err: exec: "docker-credential-gcloud": executable fi
     - Set in `infra/gcp/deploy_config.py`:
       - `PROXY_ENABLED="true"`
       - `PROXY_CAPTIONS_ONLY="true"` (recommended: proxy captions path, keep Whisper/audio download direct)
-      - `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (or `PROXY_POOL`)
+      - `PROXY_POOL` (required proxy endpoint list; comma-separated if multiple)
       - `PROXY_ROTATION_MODE="on_rate_limit"`
       - `PROXY_MAX_RETRIES="3"`
       - `PROXY_BACKOFF_SECONDS="2"`
       - `OPENAI_TRUST_ENV_PROXY="false"` (recommended so OpenAI Whisper/chat calls stay direct and only YouTube egress uses proxy pool logic)
       - Webshare rotating endpoint example:
         - `PROXY_POOL="http://<username>:<password>@p.webshare.io:80"`
-        - or set `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` to that same endpoint
     - Optional auto-generation (instead of manually listing all proxies):
       - `PROXY_AUTOGENERATE="true"`
       - `PROXY_AUTOGENERATE_TEMPLATE="http://user:pass@proxy{i}.provider.net:80{i}"`
@@ -579,7 +609,8 @@ bash infra/gcp/resume_stack.sh
 
 Notes:
 - These scripts do not delete resources; they only pause/resume runtime components.
-- Memorystore Redis is not paused by these commands (Google keeps it running until deleted).
+- If `REDIS_RUNTIME=memorystore`, Redis is not paused by these commands (Google keeps it running until deleted).
+- If `REDIS_RUNTIME=worker_vm`, Redis runs on the worker VM and therefore pauses/resumes with the VM.
 
 ### `validate_deploy.sh`
 - Verifies:
@@ -602,6 +633,79 @@ Notes:
 
 ### `run_backfill_with_cloudsql_proxy.ps1`
 - PowerShell wrapper for Windows that runs `run_backfill_with_cloudsql_proxy.sh`
+
+## Online Cost-Optimized Mode (app stays on)
+
+Goal:
+- keep API/web/worker online
+- reduce idle baseline cost by removing Memorystore and downsizing Cloud SQL
+
+Recommended settings in `infra/gcp/deploy_config.py`:
+
+```python
+WORKER_RUNTIME="compute_engine"
+REDIS_RUNTIME="worker_vm"
+SQL_TIER="db-f1-micro"   # target; helper falls back to db-g1-small
+# REDIS_VM_REQUIREPASS="..."  # prefer shell env override so secrets are not committed
+```
+
+What changes in this mode:
+- Cloud Run API still runs on Cloud Run.
+- Worker still runs on the persistent VM (same YouTube Chrome/cookies workflow).
+- Redis queue runs on the worker VM instead of Memorystore.
+- Cloud SQL is right-sized to a shared-core tier for low traffic.
+
+### Cutover sequence (recommended)
+
+1. Resume stack if currently paused:
+```bash
+bash infra/gcp/resume_stack.sh
+```
+2. Set a Redis password for VM mode (shell env override recommended):
+```bash
+export REDIS_VM_REQUIREPASS="replace-me-with-random-password"
+```
+3. Provision/update VM (installs `redis-server` if needed):
+```bash
+bash infra/gcp/provision_worker_vm.sh
+```
+4. Deploy worker VM code/env (also configures `redis-server` in VM mode):
+```bash
+bash infra/gcp/deploy_worker_vm.sh
+```
+5. Deploy API (updates `REDIS_URL` to worker VM internal IP in VM Redis mode):
+```bash
+BUILD_AND_PUSH_API=false bash infra/gcp/deploy_api.sh
+```
+6. Right-size Cloud SQL (tries `SQL_TIER`, falls back to `db-g1-small`):
+```bash
+bash infra/gcp/rightsize_online_costs.sh
+```
+7. Validate one real job end-to-end.
+8. Delete Memorystore only after validation:
+```bash
+gcloud redis instances delete "${REDIS_INSTANCE}" --region "${REGION}" --quiet
+```
+
+### Rollback to Memorystore (if needed)
+
+1. Recreate/restore Redis instance (`capstone-redis`) if deleted.
+2. Set:
+```python
+REDIS_RUNTIME="memorystore"
+```
+3. Redeploy:
+```bash
+BUILD_AND_PUSH_API=false bash infra/gcp/deploy_api.sh
+bash infra/gcp/deploy_worker_vm.sh
+```
+4. Verify queue processing.
+
+### Tradeoffs
+
+- VM Redis is cheaper but less managed than Memorystore.
+- Shared-core Cloud SQL is slower than custom tiers, but often good enough for small personal workloads.
+- `pause_stack.sh` / `resume_stack.sh` still exist as optional extra savings; they are not the main online cost-reduction strategy.
 
 ## Typical sequence
 

@@ -51,6 +51,10 @@ class WebSettings:
     api_base_url: str = os.getenv("API_BASE_URL", "http://localhost:8000")
     upload_url_expiry_seconds: int = int(os.getenv("UPLOAD_URL_EXPIRY_SECONDS", "900"))
     download_url_expiry_seconds: int = int(os.getenv("DOWNLOAD_URL_EXPIRY_SECONDS", "900"))
+    webapp_google_client_id: str = os.getenv("WEBAPP_GOOGLE_CLIENT_ID", "").strip()
+    webapp_disable_auth: bool = _env_bool("WEBAPP_DISABLE_AUTH", False)
+    webapp_dev_user_email: str = os.getenv("WEBAPP_DEV_USER_EMAIL", "dev@example.com")
+    legacy_jobs_owner_email: str = os.getenv("LEGACY_JOBS_OWNER_EMAIL", "danmcneary8@gmail.com")
 
 
 settings = WebSettings()

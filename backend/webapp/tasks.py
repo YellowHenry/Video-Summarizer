@@ -122,9 +122,6 @@ def _has_youtube_auth_config() -> bool:
         "PROXY_ENABLED",
         "PROXY_CAPTIONS_ONLY",
         "PROXY_POOL",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
     )
     return any(bool(os.getenv(name, "").strip()) for name in auth_vars)
 
@@ -157,6 +154,7 @@ def process_job(job_id: str) -> None:
             return
 
         summarize_result = None
+        skip_caption_retry_in_summarize = False
 
         if job.source_type == "youtube":
             if not job.source_url:
@@ -196,6 +194,21 @@ def process_job(job_id: str) -> None:
                         job.id,
                         exc,
                     )
+                    skip_caption_retry_in_summarize = True
+                    allow_whisper_fallback = True if job.allow_whisper_fallback is None else bool(job.allow_whisper_fallback)
+                    if not allow_whisper_fallback:
+                        job.captions_attempted = True
+                        job.captions_status = "fallback_disabled"
+                        job.captions_detail = str(exc)
+                        session.add(job)
+                        session.commit()
+                        _update_job_status(
+                            job,
+                            session,
+                            "failed",
+                            f"YouTube captions unavailable and Whisper fallback is disabled: {exc}",
+                        )
+                        return
 
             if summarize_result is None:
                 _update_job_status(job, session, "downloading")
@@ -216,7 +229,7 @@ def process_job(job_id: str) -> None:
             summarize_result = summarizer.summarize(
                 compressed,
                 youtube_url=job.source_url if job.source_type == "youtube" else None,
-                prefer_youtube_captions=job.prefer_youtube_captions,
+                prefer_youtube_captions=bool(job.prefer_youtube_captions and not skip_caption_retry_in_summarize),
             )
 
         job.transcript_source = summarize_result.transcript_source
@@ -281,6 +294,7 @@ def process_job(job_id: str) -> None:
             display_name=job.title,
             status="complete",
             prefer_youtube_captions=job.prefer_youtube_captions,
+            allow_whisper_fallback=True if job.allow_whisper_fallback is None else bool(job.allow_whisper_fallback),
             transcript_source=job.transcript_source,
             captions_attempted=job.captions_attempted,
             captions_status=job.captions_status,
