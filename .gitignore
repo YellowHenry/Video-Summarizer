@@ -23,6 +23,7 @@ ENV/
 web/node_modules/
 web/dist/
 web/.vite/
+web/.auth/
 web/playwright-report/
 web/test-results/
 

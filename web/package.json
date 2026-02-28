@@ -7,7 +7,14 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test:e2e": "playwright test"
+    "preview:start": "vite --host 127.0.0.1 --port 5173",
+    "preview:verify": "playwright test --grep @verify",
+    "preview:session:clear": "node -e \"require('fs').rmSync('.auth', { recursive: true, force: true })\"",
+    "test:e2e": "playwright test",
+    "test:e2e:update": "playwright test --update-snapshots",
+    "test:e2e:shots": "playwright test",
+    "test:e2e:request": "playwright test --grep @request",
+    "test:e2e:request:update": "playwright test --grep @request --update-snapshots"
   },
   "dependencies": {
     "react": "^18.3.1",

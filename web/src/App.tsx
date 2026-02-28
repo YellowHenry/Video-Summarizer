@@ -127,6 +127,23 @@ function fmtDate(value: string | null | undefined): string {
   }
 }
 
+function fmtListDate(value: string | null | undefined): string {
+  if (!value) {
+    return "-";
+  }
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      month: "numeric",
+      day: "numeric",
+      year: "2-digit",
+      hour: "numeric",
+      minute: "2-digit"
+    }).format(new Date(value));
+  } catch {
+    return value;
+  }
+}
+
 export default function App() {
   const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "");
   const [authProfile, setAuthProfile] = useState<AuthMeResponse | null>(null);
@@ -181,6 +198,11 @@ export default function App() {
   };
 
   const selectedJobRow = useMemo(() => jobs.find((job) => job.id === selectedJobId), [jobs, selectedJobId]);
+  const totalJobsLabel = useMemo(() => jobs.length.toLocaleString("en-US"), [jobs.length]);
+  const completedJobsLabel = useMemo(
+    () => jobs.filter((job) => String(job.status).toLowerCase() === "complete").length.toLocaleString("en-US"),
+    [jobs]
+  );
 
   useEffect(() => {
     if (window.google?.accounts?.id) {
@@ -509,349 +531,367 @@ export default function App() {
   }
 
   return (
-    <div className="page">
-      <header className="header">
-        <div>
-          <h1>Audio Summarizer</h1>
-          <p className="muted">{authProfile.email}</p>
-        </div>
-        <div className="header-actions">
-          <div className="tabbar">
+    <div className="page-shell">
+      <div className="page">
+        <header className="header">
+          <div className="header-brand">
+            <div className="brand-row">
+              <div className="brand-badge" aria-hidden>
+                AS
+              </div>
+              <div className="mini-nav" aria-hidden>
+                <span>Overview</span>
+                <span>Learn</span>
+                <span>Support</span>
+              </div>
+            </div>
+            <h1>General statistics</h1>
+            <p className="muted">{authProfile.email}</p>
+          </div>
+          <div className="header-actions">
+            <div className="tabbar">
+              <button
+                type="button"
+                className={activeTab === "jobs" ? "tab active" : "tab"}
+                onClick={() => setActiveTab("jobs")}
+              >
+                Jobs
+              </button>
+              <button
+                type="button"
+                className={activeTab === "search" ? "tab active" : "tab"}
+                onClick={() => setActiveTab("search")}
+              >
+                Global Search
+              </button>
+            </div>
             <button
               type="button"
-              className={activeTab === "jobs" ? "tab active" : "tab"}
-              onClick={() => setActiveTab("jobs")}
+              className="signout-btn"
+              onClick={() => {
+                clearSession();
+                if (window.google?.accounts?.id) {
+                  window.google.accounts.id.disableAutoSelect();
+                }
+              }}
             >
-              Jobs
-            </button>
-            <button
-              type="button"
-              className={activeTab === "search" ? "tab active" : "tab"}
-              onClick={() => setActiveTab("search")}
-            >
-              Global Search
+              Sign out
             </button>
           </div>
-          <button
-            type="button"
-            className="signout-btn"
-            onClick={() => {
-              clearSession();
-              if (window.google?.accounts?.id) {
-                window.google.accounts.id.disableAutoSelect();
-              }
-            }}
-          >
-            Sign out
-          </button>
-        </div>
-      </header>
+        </header>
 
-      {errorText && <div className="error">Error: {errorText}</div>}
+        {errorText && <div className="error">Error: {errorText}</div>}
 
-      <section className="card">
-        <h2>Submit Job</h2>
-        <form className="submit-grid" onSubmit={submitJob}>
-          <div>
-            <label htmlFor="youtube-url-input">YouTube URL</label>
-            <input
-              id="youtube-url-input"
-              value={youtubeUrl}
-              onChange={(event) => setYoutubeUrl(event.target.value)}
-              placeholder="https://www.youtube.com/watch?v=..."
-            />
-          </div>
-          <div>
-            <label htmlFor="upload-file-input">Upload file</label>
-            <input
-              id="upload-file-input"
-              type="file"
-              onChange={(event) => setFile(event.target.files?.[0] || null)}
-            />
-          </div>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={preferCaptions}
-              onChange={(event) => setPreferCaptions(event.target.checked)}
-            />
-            Prefer YouTube captions first
-          </label>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={allowWhisperFallback}
-              disabled={!preferCaptions}
-              onChange={(event) => setAllowWhisperFallback(event.target.checked)}
-            />
-            Allow Whisper fallback when captions are unavailable (turn off for captions-only)
-          </label>
-          <button type="submit" disabled={busySubmit}>
-            {busySubmit ? "Submitting..." : "Submit"}
-          </button>
-        </form>
-      </section>
-
-      {activeTab === "jobs" && (
-        <section className="content-grid">
-          <article className="card jobs-list-card">
-            <div className="row-between">
-              <h2>Jobs</h2>
-              <span className="muted">{jobsLoading ? "Refreshing..." : `${jobs.length} total`}</span>
-            </div>
-            <div className="job-table-wrap">
-              <table className="job-table">
-                <thead>
-                  <tr>
-                    <th>Created</th>
-                    <th>Title / Source</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {jobs.map((job) => (
-                    <tr
-                      key={job.id}
-                      className={selectedJobId === job.id ? "selected" : ""}
-                      onClick={() => setSelectedJobId(job.id)}
-                    >
-                      <td>{fmtDate(job.created_at)}</td>
-                      <td>
-                        <div>{job.title || job.source_url || "(untitled job)"}</div>
-                      </td>
-                      <td>{job.status}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </article>
-
-          <article className="card job-detail-card">
-            <h2>Job Detail</h2>
-            {!selectedJobId ? (
-              <p className="muted">Select a job from the table.</p>
-            ) : (
-              <div className="job-detail-body">
-                <div className="detail-grid">
-                  <div>
-                    <div className="muted">Created</div>
-                    <div>{fmtDate(selectedJob?.created_at || selectedJobRow?.created_at)}</div>
-                  </div>
-                  <div>
-                    <div className="muted">Status</div>
-                    <div>{selectedJob?.status || selectedJobRow?.status || "-"}</div>
-                  </div>
-                  <div className="detail-span-2">
-                    <div className="muted">Source URL</div>
-                    <div className="source-url">
-                      {selectedJob?.source_url || selectedJobRow?.source_url ? (
-                        <a
-                          href={selectedJob?.source_url || selectedJobRow?.source_url || "#"}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          {selectedJob?.source_url || selectedJobRow?.source_url}
-                        </a>
-                      ) : (
-                        "-"
-                      )}
-                    </div>
-                  </div>
+        {activeTab === "jobs" && (
+          <section className="content-grid">
+            <section className="card submit-card">
+              <h2>Submit Job</h2>
+              <p className="submit-meta">{totalJobsLabel} total jobs</p>
+              <form className="submit-grid" onSubmit={submitJob}>
+                <div>
+                  <label htmlFor="youtube-url-input">YouTube URL</label>
+                  <input
+                    id="youtube-url-input"
+                    value={youtubeUrl}
+                    onChange={(event) => setYoutubeUrl(event.target.value)}
+                    placeholder="https://www.youtube.com/watch?v=..."
+                  />
                 </div>
+                <div>
+                  <label htmlFor="upload-file-input">Upload file</label>
+                  <input
+                    id="upload-file-input"
+                    type="file"
+                    onChange={(event) => setFile(event.target.files?.[0] || null)}
+                  />
+                </div>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={preferCaptions}
+                    onChange={(event) => setPreferCaptions(event.target.checked)}
+                  />
+                  Prefer YouTube captions first
+                </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={allowWhisperFallback}
+                    disabled={!preferCaptions}
+                    onChange={(event) => setAllowWhisperFallback(event.target.checked)}
+                  />
+                  Allow Whisper fallback when captions are unavailable
+                </label>
+                <button type="submit" disabled={busySubmit}>
+                  {busySubmit ? "Submitting..." : "Submit"}
+                </button>
+              </form>
+              <div className="submit-footer">
+                <span>Completed jobs</span>
+                <strong>{completedJobsLabel}</strong>
+              </div>
+            </section>
 
-                <details className="debug-disclosure">
-                  <summary>Debug info</summary>
-                  <div className="debug-grid">
-                    <div className="debug-span-2">
-                      <div className="muted">Job ID</div>
-                      <div className="mono">{selectedJobId}</div>
+            <article className="card jobs-list-card">
+              <div className="row-between">
+                <h2>Jobs</h2>
+                <span className="muted">{jobsLoading ? "Refreshing..." : `${jobs.length} total`}</span>
+              </div>
+              <div className="job-table-wrap">
+                <table className="job-table">
+                  <thead>
+                    <tr>
+                      <th>Created</th>
+                      <th>Job</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {jobs.map((job) => (
+                      <tr
+                        key={job.id}
+                        className={selectedJobId === job.id ? "selected" : ""}
+                        onClick={() => setSelectedJobId(job.id)}
+                      >
+                        <td className="job-created">{fmtListDate(job.created_at)}</td>
+                        <td className="job-primary">
+                          <div className="job-title">{job.title || job.source_url || "(untitled job)"}</div>
+                          <div className="job-meta-row">
+                            <span className="job-status-chip">{job.status || "unknown"}</span>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article className="card job-detail-card">
+              <h2>Job Detail</h2>
+              {!selectedJobId ? (
+                <p className="muted">Select a job from the table.</p>
+              ) : (
+                <div className="job-detail-body">
+                  <div className="detail-grid">
+                    <div>
+                      <div className="muted">Created</div>
+                      <div>{fmtDate(selectedJob?.created_at || selectedJobRow?.created_at)}</div>
                     </div>
                     <div>
-                      <div className="muted">Transcript Source</div>
-                      <div>{selectedJob?.transcript_source || "-"}</div>
+                      <div className="muted">Status</div>
+                      <div>{selectedJob?.status || selectedJobRow?.status || "-"}</div>
                     </div>
-                    <div>
-                      <div className="muted">Whisper Fallback</div>
-                      <div>
-                        {selectedJob ? (selectedJob.allow_whisper_fallback ? "allowed" : "disabled") : "-"}
+                    <div className="detail-span-2">
+                      <div className="muted">Source URL</div>
+                      <div className="source-url">
+                        {selectedJob?.source_url || selectedJobRow?.source_url ? (
+                          <a
+                            href={selectedJob?.source_url || selectedJobRow?.source_url || "#"}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {selectedJob?.source_url || selectedJobRow?.source_url}
+                          </a>
+                        ) : (
+                          "-"
+                        )}
                       </div>
                     </div>
                   </div>
-                </details>
 
-                {selectedJob?.error && <div className="error">Job error: {selectedJob.error}</div>}
-
-                <div className="job-detail-tabbar" role="tablist" aria-label="Job detail sections">
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={jobDetailTab === "summary"}
-                    className={jobDetailTab === "summary" ? "tab active" : "tab"}
-                    onClick={() => setJobDetailTab("summary")}
-                  >
-                    Summary
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={jobDetailTab === "transcript"}
-                    className={jobDetailTab === "transcript" ? "tab active" : "tab"}
-                    onClick={() => setJobDetailTab("transcript")}
-                  >
-                    Transcript
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={jobDetailTab === "chat"}
-                    className={jobDetailTab === "chat" ? "tab active" : "tab"}
-                    onClick={() => setJobDetailTab("chat")}
-                  >
-                    Job Chat
-                  </button>
-                </div>
-
-                {jobDetailTab === "summary" && (
-                  <section className="job-detail-tab-panel" aria-label="Summary">
-                    {summaryArtifact?.file_link && (
-                      <p>
-                        <a href={summaryArtifact.file_link} target="_blank" rel="noreferrer">
-                          Open summary file
-                        </a>
-                      </p>
-                    )}
-                    {summaryArtifact?.text ? (
-                      <MarkdownBlock text={summaryArtifact.text} className="markdown-panel summary-panel" />
-                    ) : (
-                      <pre className="summary-panel">(no summary yet)</pre>
-                    )}
-                  </section>
-                )}
-
-                {jobDetailTab === "transcript" && (
-                  <section className="job-detail-tab-panel" aria-label="Transcript">
-                    {transcriptArtifact?.file_link && (
-                      <p>
-                        <a href={transcriptArtifact.file_link} target="_blank" rel="noreferrer">
-                          Open transcript file
-                        </a>
-                      </p>
-                    )}
-                    <pre className="transcript-panel">{transcriptArtifact?.text || "(no transcript yet)"}</pre>
-                  </section>
-                )}
-
-                {jobDetailTab === "chat" && (
-                  <section className="job-detail-tab-panel" aria-label="Job Chat">
-                    <div className="chat-box">
-                      {chat.map((msg) => (
-                        <div key={msg.id} className={`chat-msg ${msg.role}`}>
-                          <div className="chat-role">
-                            <strong>{msg.role}:</strong>
-                          </div>
-                          {msg.role === "assistant" ? (
-                            <MarkdownBlock text={msg.content} className="chat-markdown" />
-                          ) : (
-                            <div className="chat-plain">{msg.content}</div>
-                          )}
+                  <details className="debug-disclosure">
+                    <summary>Debug info</summary>
+                    <div className="debug-grid">
+                      <div className="debug-span-2">
+                        <div className="muted">Job ID</div>
+                        <div className="mono">{selectedJobId}</div>
+                      </div>
+                      <div>
+                        <div className="muted">Transcript Source</div>
+                        <div>{selectedJob?.transcript_source || "-"}</div>
+                      </div>
+                      <div>
+                        <div className="muted">Whisper Fallback</div>
+                        <div>
+                          {selectedJob ? (selectedJob.allow_whisper_fallback ? "allowed" : "disabled") : "-"}
                         </div>
-                      ))}
-                      {chat.length === 0 && <div className="muted">(no chat messages yet)</div>}
+                      </div>
                     </div>
-                    <form className="chat-row" onSubmit={sendJobChat}>
-                      <input
-                        value={chatInput}
-                        onChange={(event) => setChatInput(event.target.value)}
-                        placeholder="Ask about this transcript..."
-                      />
-                      <button type="submit" disabled={chatBusy || !selectedJobId}>
-                        {chatBusy ? "Sending..." : "Send"}
-                      </button>
-                    </form>
-                    {chatContextStats.length > 0 && (
-                      <div className="muted small">Context: {chatContextStats.join(", ")}</div>
-                    )}
-                  </section>
-                )}
-              </div>
-            )}
-          </article>
-        </section>
-      )}
+                  </details>
 
-      {activeTab === "search" && (
-        <section className="card">
-          <h2>Global Search</h2>
-          <form className="search-grid" onSubmit={runSearch}>
-            <div>
-              <label htmlFor="search-question-input">Question</label>
-              <input
-                id="search-question-input"
-                value={searchQ}
-                onChange={(event) => setSearchQ(event.target.value)}
-                placeholder="What topics were discussed about baseball?"
-              />
-            </div>
-            <div>
-              <label htmlFor="search-youtube-url-input">Filter by YouTube URL (optional)</label>
-              <input
-                id="search-youtube-url-input"
-                value={searchYoutubeUrl}
-                onChange={(event) => setSearchYoutubeUrl(event.target.value)}
-                placeholder="https://www.youtube.com/watch?v=..."
-              />
-            </div>
-            <div>
-              <label htmlFor="search-created-after-input">Created after (optional)</label>
-              <input
-                id="search-created-after-input"
-                type="date"
-                value={searchCreatedAfter}
-                onChange={(event) => setSearchCreatedAfter(event.target.value)}
-              />
-            </div>
-            <div>
-              <label htmlFor="search-created-before-input">Created before (optional)</label>
-              <input
-                id="search-created-before-input"
-                type="date"
-                value={searchCreatedBefore}
-                onChange={(event) => setSearchCreatedBefore(event.target.value)}
-              />
-            </div>
-            <button type="submit">Run Search</button>
-          </form>
+                  {selectedJob?.error && <div className="error">Job error: {selectedJob.error}</div>}
 
-          <h3>Answer</h3>
-          {searchResult?.answer ? (
-            <MarkdownBlock text={searchResult.answer} className="markdown-panel" />
-          ) : (
-            <pre>(no answer yet)</pre>
-          )}
+                  <div className="job-detail-tabbar" role="tablist" aria-label="Job detail sections">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={jobDetailTab === "summary"}
+                      className={jobDetailTab === "summary" ? "tab active" : "tab"}
+                      onClick={() => setJobDetailTab("summary")}
+                    >
+                      Summary
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={jobDetailTab === "transcript"}
+                      className={jobDetailTab === "transcript" ? "tab active" : "tab"}
+                      onClick={() => setJobDetailTab("transcript")}
+                    >
+                      Transcript
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={jobDetailTab === "chat"}
+                      className={jobDetailTab === "chat" ? "tab active" : "tab"}
+                      onClick={() => setJobDetailTab("chat")}
+                    >
+                      Job Chat
+                    </button>
+                  </div>
 
-          <h3>Matched Chunks</h3>
-          <div className="search-hits">
-            {searchResult?.hits?.map((hit, index) => (
-              <div key={`${hit.job_id}:${hit.kind}:${hit.chunk_index}:${index}`} className="hit">
-                <div className="hit-meta">
-                  <span className="mono">{hit.job_id}</span>
-                  <span>
-                    {hit.kind} #{hit.chunk_index}
-                  </span>
-                  {hit.file_link && (
-                    <a href={hit.file_link} target="_blank" rel="noreferrer">
-                      Open source
-                    </a>
+                  {jobDetailTab === "summary" && (
+                    <section className="job-detail-tab-panel" aria-label="Summary">
+                      {summaryArtifact?.file_link && (
+                        <p>
+                          <a href={summaryArtifact.file_link} target="_blank" rel="noreferrer">
+                            Open summary file
+                          </a>
+                        </p>
+                      )}
+                      {summaryArtifact?.text ? (
+                        <MarkdownBlock text={summaryArtifact.text} className="markdown-panel summary-panel" />
+                      ) : (
+                        <pre className="summary-panel">(no summary yet)</pre>
+                      )}
+                    </section>
+                  )}
+
+                  {jobDetailTab === "transcript" && (
+                    <section className="job-detail-tab-panel" aria-label="Transcript">
+                      {transcriptArtifact?.file_link && (
+                        <p>
+                          <a href={transcriptArtifact.file_link} target="_blank" rel="noreferrer">
+                            Open transcript file
+                          </a>
+                        </p>
+                      )}
+                      <pre className="transcript-panel">{transcriptArtifact?.text || "(no transcript yet)"}</pre>
+                    </section>
+                  )}
+
+                  {jobDetailTab === "chat" && (
+                    <section className="job-detail-tab-panel" aria-label="Job Chat">
+                      <div className="chat-box">
+                        {chat.map((msg) => (
+                          <div key={msg.id} className={`chat-msg ${msg.role}`}>
+                            <div className="chat-role">
+                              <strong>{msg.role}:</strong>
+                            </div>
+                            {msg.role === "assistant" ? (
+                              <MarkdownBlock text={msg.content} className="chat-markdown" />
+                            ) : (
+                              <div className="chat-plain">{msg.content}</div>
+                            )}
+                          </div>
+                        ))}
+                        {chat.length === 0 && <div className="muted">(no chat messages yet)</div>}
+                      </div>
+                      <form className="chat-row" onSubmit={sendJobChat}>
+                        <input
+                          value={chatInput}
+                          onChange={(event) => setChatInput(event.target.value)}
+                          placeholder="Ask about this transcript..."
+                        />
+                        <button type="submit" disabled={chatBusy || !selectedJobId}>
+                          {chatBusy ? "Sending..." : "Send"}
+                        </button>
+                      </form>
+                      {chatContextStats.length > 0 && (
+                        <div className="muted small">Context: {chatContextStats.join(", ")}</div>
+                      )}
+                    </section>
                   )}
                 </div>
-                <div>{hit.snippet}</div>
+              )}
+            </article>
+          </section>
+        )}
+
+        {activeTab === "search" && (
+          <section className="card search-card">
+            <h2>Global Search</h2>
+            <form className="search-grid" onSubmit={runSearch}>
+              <div>
+                <label htmlFor="search-question-input">Question</label>
+                <input
+                  id="search-question-input"
+                  value={searchQ}
+                  onChange={(event) => setSearchQ(event.target.value)}
+                  placeholder="What topics were discussed about baseball?"
+                />
               </div>
-            ))}
-            {!searchResult?.hits?.length && <div className="muted">(no chunks yet)</div>}
-          </div>
-        </section>
-      )}
+              <div>
+                <label htmlFor="search-youtube-url-input">Filter by YouTube URL (optional)</label>
+                <input
+                  id="search-youtube-url-input"
+                  value={searchYoutubeUrl}
+                  onChange={(event) => setSearchYoutubeUrl(event.target.value)}
+                  placeholder="https://www.youtube.com/watch?v=..."
+                />
+              </div>
+              <div>
+                <label htmlFor="search-created-after-input">Created after (optional)</label>
+                <input
+                  id="search-created-after-input"
+                  type="date"
+                  value={searchCreatedAfter}
+                  onChange={(event) => setSearchCreatedAfter(event.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="search-created-before-input">Created before (optional)</label>
+                <input
+                  id="search-created-before-input"
+                  type="date"
+                  value={searchCreatedBefore}
+                  onChange={(event) => setSearchCreatedBefore(event.target.value)}
+                />
+              </div>
+              <button type="submit">Run Search</button>
+            </form>
+
+            <h3>Answer</h3>
+            {searchResult?.answer ? (
+              <MarkdownBlock text={searchResult.answer} className="markdown-panel" />
+            ) : (
+              <pre>(no answer yet)</pre>
+            )}
+
+            <h3>Matched Chunks</h3>
+            <div className="search-hits">
+              {searchResult?.hits?.map((hit, index) => (
+                <div key={`${hit.job_id}:${hit.kind}:${hit.chunk_index}:${index}`} className="hit">
+                  <div className="hit-meta">
+                    <span className="mono">{hit.job_id}</span>
+                    <span>
+                      {hit.kind} #{hit.chunk_index}
+                    </span>
+                    {hit.file_link && (
+                      <a href={hit.file_link} target="_blank" rel="noreferrer">
+                        Open source
+                      </a>
+                    )}
+                  </div>
+                  <div>{hit.snippet}</div>
+                </div>
+              ))}
+              {!searchResult?.hits?.length && <div className="muted">(no chunks yet)</div>}
+            </div>
+          </section>
+        )}
+      </div>
     </div>
   );
 }
