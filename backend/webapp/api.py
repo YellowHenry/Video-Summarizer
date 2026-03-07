@@ -35,6 +35,7 @@ from .schemas import (
     SearchRequest,
     SearchResponse,
 )
+from .title_resolver import looks_like_url, resolve_display_title
 
 
 configure_logging()
@@ -106,7 +107,7 @@ def _assert_object_access(object_key: str, owner_email: str, metadata: MetadataS
     raise HTTPException(status_code=404, detail="Artifact not found")
 
 
-def _job_to_summary(job: JobRecord) -> JobSummary:
+def _job_to_summary(job: JobRecord, resolved_title: str | None = None) -> JobSummary:
     return JobSummary(
         id=job.id,
         created_at=job.created_at,
@@ -114,11 +115,11 @@ def _job_to_summary(job: JobRecord) -> JobSummary:
         status=job.status,
         source_type=job.source_type,
         source_url=job.source_url,
-        title=job.title,
+        title=resolved_title if resolved_title is not None else job.title,
     )
 
 
-def _job_to_detail(job: JobRecord) -> JobDetail:
+def _job_to_detail(job: JobRecord, resolved_title: str | None = None) -> JobDetail:
     return JobDetail(
         id=job.id,
         created_at=job.created_at,
@@ -126,7 +127,7 @@ def _job_to_detail(job: JobRecord) -> JobDetail:
         status=job.status,
         source_type=job.source_type,
         source_url=job.source_url,
-        title=job.title,
+        title=resolved_title if resolved_title is not None else job.title,
         prefer_youtube_captions=job.prefer_youtube_captions,
         allow_whisper_fallback=True if job.allow_whisper_fallback is None else bool(job.allow_whisper_fallback),
         transcript_source=job.transcript_source,
@@ -137,6 +138,16 @@ def _job_to_detail(job: JobRecord) -> JobDetail:
         transcript_object_key=job.transcript_object_key,
         error=job.error,
     )
+
+
+def _resolve_job_title_for_response(job: JobRecord, *, allow_oembed: bool) -> tuple[str, str, bool]:
+    resolved_title, source = resolve_display_title(job.title, job.source_url, allow_oembed=allow_oembed)
+    should_persist = (
+        source == "oembed"
+        and bool(resolved_title.strip())
+        and (not job.title or looks_like_url(job.title) or job.title.strip() != resolved_title)
+    )
+    return resolved_title, source, should_persist
 
 
 @app.get("/healthz")
@@ -253,7 +264,24 @@ def list_jobs(
     current_user: AuthUser = Depends(require_user),
 ) -> list[JobSummary]:
     jobs = metadata.list_jobs(_normalize_owner_email(current_user.email))
-    return [_job_to_summary(job) for job in jobs]
+    unresolved_lookup_budget = 8
+    summaries: list[JobSummary] = []
+    for job in jobs:
+        is_unresolved = not job.title or looks_like_url(job.title)
+        allow_oembed = bool(is_unresolved and unresolved_lookup_budget > 0)
+        if allow_oembed:
+            unresolved_lookup_budget -= 1
+        resolved_title, source, should_persist = _resolve_job_title_for_response(job, allow_oembed=allow_oembed)
+        if should_persist:
+            metadata.update_job(job, title=resolved_title)
+        logger.debug(
+            "job title resolver source=%s persisted=%s job_id=%s",
+            source,
+            str(bool(should_persist)).lower(),
+            job.id,
+        )
+        summaries.append(_job_to_summary(job, resolved_title=resolved_title))
+    return summaries
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobDetail)
@@ -262,10 +290,20 @@ def get_job(
     db: Session = Depends(get_db),
     current_user: AuthUser = Depends(require_user),
 ) -> JobDetail:
-    job = MetadataStore(db).get_job(job_id, _normalize_owner_email(current_user.email))
+    metadata = MetadataStore(db)
+    job = metadata.get_job(job_id, _normalize_owner_email(current_user.email))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return _job_to_detail(job)
+    resolved_title, source, should_persist = _resolve_job_title_for_response(job, allow_oembed=True)
+    if should_persist:
+        metadata.update_job(job, title=resolved_title)
+    logger.debug(
+        "job title resolver source=%s persisted=%s job_id=%s",
+        source,
+        str(bool(should_persist)).lower(),
+        job.id,
+    )
+    return _job_to_detail(job, resolved_title=resolved_title)
 
 
 def _artifact_from_job(
@@ -377,15 +415,26 @@ def post_job_chat(
 
     metadata.append_chat_message(job_id, "user", message)
 
-    result = services.qa_service.answer_job_chat(
-        message,
-        transcript_text=transcript,
-        conversation_history=history_before,
-        summary_text=summary_text,
-    )
-    metadata.append_chat_message(job_id, "assistant", result.answer)
-
-    return ChatAnswerResponse(answer=result.answer, context_stats=result.contexts)
+    try:
+        result = services.qa_service.answer_job_chat(
+            message,
+            transcript_text=transcript,
+            conversation_history=history_before,
+            summary_text=summary_text,
+        )
+        metadata.append_chat_message(job_id, "assistant", result.answer)
+        return ChatAnswerResponse(answer=result.answer, context_stats=result.contexts)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Job chat generation failed for job %s", job_id)
+        fallback_answer = (
+            "I hit a temporary chat-model error while answering that. "
+            "Please send the message again in a few seconds."
+        )
+        metadata.append_chat_message(job_id, "assistant", fallback_answer)
+        return ChatAnswerResponse(
+            answer=fallback_answer,
+            context_stats=[f"chat_fallback=temporary_model_error:{type(exc).__name__}"],
+        )
 
 
 @app.post("/api/search", response_model=SearchResponse)

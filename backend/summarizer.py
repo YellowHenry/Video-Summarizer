@@ -766,6 +766,9 @@ class CloudSummarizerClient:
             "skip_download": True,
             "extract_flat": False,
             "noplaylist": True,
+            # Caption metadata can still be present when playable formats are blocked/challenged.
+            # We only need subtitle/automatic_captions here, so don't hard-fail on missing formats.
+            "ignore_no_formats_error": True,
         }
         browser_cookie = self._resolve_caption_cookie_source()
         cookie_file = resolve_cookies_file()

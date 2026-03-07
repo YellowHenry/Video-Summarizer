@@ -39,6 +39,12 @@ export async function setupMockApi(page: Page): Promise<void> {
     });
   });
 
+  await page.route("**/oembed**", async (route) => {
+    await route.fulfill({
+      json: { title: "Mock Video Title", author_name: "Mock Channel", provider_name: "YouTube" }
+    });
+  });
+
   await page.route("**/api/jobs", async (route) => {
     const method = route.request().method();
     if (method === "GET") {
@@ -56,7 +62,7 @@ export async function setupMockApi(page: Page): Promise<void> {
         status: "complete",
         source_type: body.youtube_url ? "youtube" : "upload",
         source_url: body.youtube_url || null,
-        title: "Mock Video Title"
+        title: body.youtube_url ? "Mock Video Title" : null
       });
       chats[id] = [];
       await route.fulfill({

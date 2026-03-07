@@ -56,19 +56,19 @@ p {
 
 .page-shell {
   min-height: 100vh;
-  padding: clamp(12px, 3vw, 30px);
+  padding: clamp(10px, 2.2vw, 20px);
 }
 
 .page {
   position: relative;
   max-width: 1520px;
   margin: 0 auto;
-  padding: clamp(14px, 2.4vw, 26px);
+  padding: clamp(12px, 1.9vw, 20px);
   display: grid;
-  gap: 14px;
+  gap: 10px;
   background: linear-gradient(160deg, var(--bg-shell-top) 0%, var(--bg-shell-bottom) 100%);
   border: 1px solid #2b3140;
-  border-radius: 28px;
+  border-radius: 22px;
   box-shadow: 0 36px 90px rgba(9, 12, 18, 0.45);
   overflow: hidden;
 }
@@ -102,19 +102,19 @@ p {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 14px;
-  padding-bottom: 4px;
+  gap: 10px;
+  padding-bottom: 2px;
 }
 
 .header-brand {
   display: grid;
-  gap: 10px;
+  gap: 6px;
 }
 
 .brand-row {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
 }
 
 .brand-badge {
@@ -135,15 +135,15 @@ p {
 .mini-nav {
   display: inline-flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 11px;
   letter-spacing: 0.02em;
 }
 
 .header h1 {
   font-family: "Space Grotesk", "Plus Jakarta Sans", sans-serif;
-  font-size: clamp(1.8rem, 3.1vw, 2.65rem);
+  font-size: clamp(1.55rem, 2.5vw, 2.2rem);
   line-height: 1.02;
   letter-spacing: -0.02em;
   font-weight: 600;
@@ -151,29 +151,33 @@ p {
 
 .header .muted {
   color: #8f99b2;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 .card {
   background: linear-gradient(170deg, var(--panel) 0%, #0f131b 100%);
   border: 1px solid var(--line-soft);
   border-radius: 16px;
-  padding: 14px;
+  padding: 12px;
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .content-grid {
   display: grid;
-  gap: 12px;
+  gap: 10px;
   grid-template-columns: minmax(250px, 0.72fr) minmax(280px, 0.9fr) minmax(420px, 1.38fr);
   align-items: start;
+}
+
+.content-grid.jobs-list-hidden {
+  grid-template-columns: minmax(250px, 0.72fr) minmax(820px, 1.9fr);
 }
 
 .submit-card {
@@ -182,7 +186,7 @@ p {
   color: #0e1728;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.58);
   align-self: start;
-  max-height: 700px;
+  max-height: 660px;
   overflow: auto;
 }
 
@@ -195,16 +199,16 @@ p {
 }
 
 .submit-meta {
-  margin-top: -2px;
-  margin-bottom: 2px;
+  margin-top: -1px;
+  margin-bottom: 1px;
   color: #314465;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
 }
 
 .submit-grid {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .submit-card input,
@@ -226,7 +230,7 @@ p {
 
 .submit-footer {
   margin-top: 2px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -250,13 +254,13 @@ p {
 .jobs-list-card {
   display: flex;
   flex-direction: column;
-  min-height: 580px;
+  min-height: 540px;
 }
 
 .job-table-wrap {
   overflow: auto;
   flex: 1;
-  max-height: 560px;
+  max-height: 520px;
   border-radius: 12px;
   border: 1px solid var(--line-soft);
   background: rgba(12, 17, 26, 0.62);
@@ -279,7 +283,7 @@ p {
 .job-table td {
   text-align: left;
   vertical-align: top;
-  padding: 9px 10px;
+  padding: 8px 9px;
   border-bottom: 1px solid #222a3a;
 }
 
@@ -293,7 +297,7 @@ p {
 
 .job-table td {
   color: #c6d1ea;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .job-table tbody tr {
@@ -310,9 +314,9 @@ p {
 }
 
 .job-created {
-  width: 145px;
+  width: 130px;
   color: #98a4bf;
-  font-size: 12px;
+  font-size: 11.5px;
   line-height: 1.35;
 }
 
@@ -331,7 +335,7 @@ p {
 }
 
 .job-meta-row {
-  margin-top: 5px;
+  margin-top: 4px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -354,7 +358,15 @@ p {
 .job-detail-card {
   display: flex;
   flex-direction: column;
-  min-height: 640px;
+  min-height: 600px;
+  border-color: #3a4a6c;
+  box-shadow: 0 12px 28px rgba(5, 8, 14, 0.38);
+}
+
+.job-detail-card.summary-spotlight {
+  min-height: 650px;
+  border-color: #50658f;
+  box-shadow: 0 0 0 1px rgba(188, 208, 245, 0.16), 0 20px 44px rgba(6, 9, 14, 0.5);
 }
 
 .job-detail-body {
@@ -365,21 +377,65 @@ p {
   min-height: 0;
 }
 
+.detail-title {
+  font-family: "Space Grotesk", "Plus Jakarta Sans", sans-serif;
+  font-size: clamp(1.05rem, 1.5vw, 1.35rem);
+  font-weight: 600;
+  line-height: 1.25;
+  color: #e3edff;
+  padding: 12px 14px;
+  border: 1px solid #41557e;
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(20, 27, 40, 0.88) 0%, rgba(13, 18, 28, 0.88) 100%);
+  box-shadow: inset 0 1px 0 rgba(209, 224, 255, 0.06);
+}
+
+.job-meta-section {
+  margin-top: 2px;
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid #253247;
+  border-radius: 12px;
+  background: rgba(10, 15, 24, 0.52);
+  box-shadow: none;
+}
+
+.meta-section-kicker {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8ea0bf;
+  font-weight: 600;
+}
+
+.job-meta-section .muted {
+  color: #9cafcf;
+  font-size: 12px;
+}
+
 .detail-grid {
   display: grid;
-  gap: 10px;
+  gap: 8px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .detail-grid > div {
-  padding: 10px;
-  border-radius: 10px;
-  border: 1px solid #242d3f;
-  background: rgba(12, 17, 26, 0.68);
+  padding: 9px 10px;
+  border-radius: 9px;
+  border: 1px solid #31415d;
+  background: rgba(11, 16, 25, 0.62);
+  box-shadow: none;
 }
 
 .detail-span-2 {
   grid-column: 1 / -1;
+}
+
+.job-meta-section .detail-grid > div > div:last-child {
+  font-size: 15px;
+  font-weight: 500;
+  color: #d6e3ff;
 }
 
 .source-url {
@@ -387,23 +443,24 @@ p {
 }
 
 .debug-disclosure {
-  border: 1px solid #293247;
+  border: 1px solid #31405b;
   border-radius: 10px;
-  background: rgba(13, 19, 29, 0.82);
+  background: rgba(11, 16, 25, 0.55);
   padding: 8px 10px;
+  box-shadow: none;
 }
 
 .debug-disclosure summary {
   cursor: pointer;
-  color: #c4d1ec;
+  color: #bfd0f0;
   font-weight: 600;
 }
 
 .debug-grid {
-  margin-top: 8px;
+  margin-top: 6px;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 8px;
 }
 
 .debug-span-2 {
@@ -416,9 +473,10 @@ p {
   align-items: center;
   gap: 6px;
   padding: 4px;
-  border: 1px solid #2a3347;
+  border: 1px solid #3c4f75;
   border-radius: 999px;
-  background: #0f141f;
+  background: #101827;
+  box-shadow: inset 0 1px 0 rgba(217, 231, 255, 0.05);
   width: fit-content;
   max-width: 100%;
 }
@@ -450,7 +508,7 @@ p {
 .job-detail-tab-panel {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   flex: 1;
   min-height: 0;
 }
@@ -458,17 +516,24 @@ p {
 .chat-box {
   border: 1px solid #283249;
   border-radius: 10px;
-  padding: 10px;
-  max-height: 320px;
+  padding: 8px;
+  max-height: 300px;
   overflow-y: auto;
   display: grid;
-  gap: 8px;
+  gap: 6px;
   background: #0c111a;
+}
+
+.primary-content-panel {
+  border: 1px solid #44608d;
+  background: rgba(12, 18, 29, 0.9);
+  box-shadow: 0 8px 22px rgba(5, 10, 18, 0.34), inset 0 1px 0 rgba(214, 228, 255, 0.06);
+  border-radius: 11px;
 }
 
 .chat-msg {
   border-radius: 10px;
-  padding: 8px 10px;
+  padding: 7px 9px;
   border: 1px solid #273147;
   background: #121a27;
 }
@@ -504,12 +569,12 @@ p {
 .chat-row {
   display: grid;
   grid-template-columns: 1fr auto;
-  gap: 8px;
+  gap: 6px;
 }
 
 .search-grid {
   display: grid;
-  gap: 12px;
+  gap: 10px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
@@ -525,22 +590,22 @@ p {
 .hit {
   border: 1px solid #293348;
   border-radius: 10px;
-  padding: 10px;
+  padding: 9px;
   background: #101622;
 }
 
 .hit-meta {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 6px;
+  gap: 8px;
+  margin-bottom: 5px;
 }
 
 label {
   display: block;
   font-size: 12px;
   font-weight: 600;
-  margin-bottom: 4px;
+  margin-bottom: 3px;
   color: #a2aec9;
 }
 
@@ -555,7 +620,7 @@ textarea {
   width: 100%;
   border: 1px solid #2a3348;
   border-radius: 10px;
-  padding: 9px 11px;
+  padding: 8px 10px;
   color: #e8efff;
   background: #0f1521;
 }
@@ -574,7 +639,7 @@ button {
   background: linear-gradient(180deg, var(--accent) 0%, var(--accent-soft) 100%);
   color: #0f1829;
   border-radius: 999px;
-  padding: 8px 14px;
+  padding: 7px 13px;
   font-family: "Space Grotesk", "Plus Jakarta Sans", sans-serif;
   font-weight: 600;
   cursor: pointer;
@@ -589,6 +654,18 @@ button:disabled {
   border-color: #2a3348;
   background: #0f1521;
   color: #c3d1ee;
+}
+
+.list-toggle-btn {
+  border-color: #2d3c57;
+  background: #0f1726;
+  color: #d8e5ff;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+.list-toggle-btn:hover {
+  background: #18243a;
 }
 
 .checkbox {
@@ -659,6 +736,12 @@ pre {
   max-height: none;
 }
 
+.summary-panel.primary-content-panel {
+  border-color: #44608d;
+  background: rgba(12, 18, 29, 0.9);
+  box-shadow: 0 8px 22px rgba(5, 10, 18, 0.34), inset 0 1px 0 rgba(214, 228, 255, 0.06);
+}
+
 pre.summary-panel,
 pre.transcript-panel {
   flex: 1;
@@ -669,6 +752,14 @@ pre.transcript-panel {
 .transcript-panel {
   flex: 1;
   min-height: 0;
+}
+
+.job-detail-card .summary-panel {
+  min-height: 280px;
+}
+
+.job-detail-card.summary-spotlight .summary-panel {
+  min-height: 340px;
 }
 
 .markdown-content > :first-child {
@@ -858,6 +949,10 @@ pre.transcript-panel {
     grid-template-columns: minmax(240px, 0.9fr) minmax(280px, 1fr);
   }
 
+  .content-grid.jobs-list-hidden {
+    grid-template-columns: minmax(240px, 0.8fr) minmax(280px, 1.2fr);
+  }
+
   .job-detail-card {
     grid-column: 1 / -1;
   }
@@ -883,6 +978,7 @@ pre.transcript-panel {
   }
 
   .content-grid,
+  .content-grid.jobs-list-hidden,
   .search-grid,
   .detail-grid,
   .debug-grid {

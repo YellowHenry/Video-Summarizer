@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import MarkdownBlock from "./components/MarkdownBlock";
 
 type JobSummary = {
@@ -98,6 +98,8 @@ class ApiError extends Error {
   }
 }
 
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
 async function api<T>(path: string, token: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers || {});
   headers.set("Authorization", `Bearer ${token}`);
@@ -114,6 +116,31 @@ async function api<T>(path: string, token: string, init?: RequestInit): Promise<
     throw new ApiError(response.status, text);
   }
   return (await response.json()) as T;
+}
+
+async function apiWithRetry<T>(
+  path: string,
+  token: string,
+  init?: RequestInit,
+  attempts = 2
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await api<T>(path, token, init);
+    } catch (error) {
+      lastError = error;
+      const isFetchNetworkError =
+        error instanceof TypeError && String(error.message || "").toLowerCase().includes("fetch");
+      const isApi5xx = error instanceof ApiError && error.status >= 500;
+      const shouldRetry = attempt < attempts && (isFetchNetworkError || isApi5xx);
+      if (!shouldRetry) {
+        throw error;
+      }
+      await sleep(450 * attempt);
+    }
+  }
+  throw lastError;
 }
 
 function fmtDate(value: string | null | undefined): string {
@@ -142,6 +169,50 @@ function fmtListDate(value: string | null | undefined): string {
   } catch {
     return value;
   }
+}
+
+function isApiArtifactLink(link: string): boolean {
+  try {
+    const resolved = new URL(link, window.location.origin);
+    const apiOrigin = new URL(API_BASE, window.location.origin).origin;
+    return resolved.origin === apiOrigin && resolved.pathname.startsWith("/api/artifacts/");
+  } catch {
+    return link.includes("/api/artifacts/");
+  }
+}
+
+function extractYouTubeVideoId(rawUrl: string | null | undefined): string | null {
+  if (!rawUrl) {
+    return null;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
+    if (host === "youtu.be") {
+      const id = parsed.pathname.split("/").filter(Boolean)[0];
+      return id || null;
+    }
+    if (host === "youtube.com" || host === "m.youtube.com") {
+      if (parsed.pathname === "/watch") {
+        return parsed.searchParams.get("v");
+      }
+      if (parsed.pathname.startsWith("/shorts/") || parsed.pathname.startsWith("/embed/")) {
+        const id = parsed.pathname.split("/").filter(Boolean)[1];
+        return id || null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeUrl(value: string | null | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("www.");
 }
 
 export default function App() {
@@ -175,6 +246,7 @@ export default function App() {
   const [busySubmit, setBusySubmit] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [jobDetailTab, setJobDetailTab] = useState<"summary" | "transcript" | "chat">("summary");
+  const [isJobListVisible, setIsJobListVisible] = useState(true);
 
   const clearSession = () => {
     localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
@@ -194,6 +266,10 @@ export default function App() {
       setAuthError("Session expired. Please sign in again.");
       return;
     }
+    if (error instanceof TypeError && String(error.message || "").toLowerCase().includes("fetch")) {
+      setErrorText("Network error while contacting the API. Please retry.");
+      return;
+    }
     setErrorText(String(error));
   };
 
@@ -203,6 +279,21 @@ export default function App() {
     () => jobs.filter((job) => String(job.status).toLowerCase() === "complete").length.toLocaleString("en-US"),
     [jobs]
   );
+
+  const displayJobTitle = (job: JobSummary): string => {
+    if (job.title && job.title.trim() && !looksLikeUrl(job.title)) {
+      return job.title.trim();
+    }
+    const videoId = extractYouTubeVideoId(job.source_url);
+    if (videoId) {
+      return `YouTube video (${videoId})`;
+    }
+    return job.source_url || "(untitled job)";
+  };
+  const selectedDisplayTitle = useMemo(() => {
+    const jobForTitle = selectedJob || selectedJobRow;
+    return jobForTitle ? displayJobTitle(jobForTitle) : "(no selected job)";
+  }, [selectedJob, selectedJobRow]);
 
   useEffect(() => {
     if (window.google?.accounts?.id) {
@@ -465,7 +556,7 @@ export default function App() {
           created_at: new Date().toISOString()
         }
       ]);
-      const answer = await api<ChatAnswerResponse>(`/api/jobs/${selectedJobId}/chat`, authToken, {
+      const answer = await apiWithRetry<ChatAnswerResponse>(`/api/jobs/${selectedJobId}/chat`, authToken, {
         method: "POST",
         body: JSON.stringify({ message })
       });
@@ -497,6 +588,36 @@ export default function App() {
       });
       setSearchResult(result);
       setActiveTab("search");
+    } catch (error) {
+      handleApiError(error);
+    }
+  };
+
+  const openArtifactLink = async (event: MouseEvent<HTMLAnchorElement>, fileLink: string | null | undefined) => {
+    if (!fileLink) {
+      return;
+    }
+    if (!isApiArtifactLink(fileLink)) {
+      return;
+    }
+    event.preventDefault();
+    if (!authToken) {
+      setAuthError("Sign in required to open private artifacts.");
+      return;
+    }
+    try {
+      const response = await fetch(fileLink, {
+        headers: {
+          Authorization: `Bearer ${authToken}`
+        }
+      });
+      if (!response.ok) {
+        throw new Error(`${response.status}: ${await response.text()}`);
+      }
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      window.open(blobUrl, "_blank", "noopener,noreferrer");
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
     } catch (error) {
       handleApiError(error);
     }
@@ -583,9 +704,18 @@ export default function App() {
         {errorText && <div className="error">Error: {errorText}</div>}
 
         {activeTab === "jobs" && (
-          <section className="content-grid">
+          <section className={isJobListVisible ? "content-grid" : "content-grid jobs-list-hidden"}>
             <section className="card submit-card">
-              <h2>Submit Job</h2>
+              <div className="row-between">
+                <h2>Submit Job</h2>
+                <button
+                  type="button"
+                  className="list-toggle-btn"
+                  onClick={() => setIsJobListVisible((visible) => !visible)}
+                >
+                  {isJobListVisible ? "Hide Jobs" : "Show Jobs"}
+                </button>
+              </div>
               <p className="submit-meta">{totalJobsLabel} total jobs</p>
               <form className="submit-grid" onSubmit={submitJob}>
                 <div>
@@ -632,93 +762,53 @@ export default function App() {
               </div>
             </section>
 
-            <article className="card jobs-list-card">
-              <div className="row-between">
-                <h2>Jobs</h2>
-                <span className="muted">{jobsLoading ? "Refreshing..." : `${jobs.length} total`}</span>
-              </div>
-              <div className="job-table-wrap">
-                <table className="job-table">
-                  <thead>
-                    <tr>
-                      <th>Created</th>
-                      <th>Job</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {jobs.map((job) => (
-                      <tr
-                        key={job.id}
-                        className={selectedJobId === job.id ? "selected" : ""}
-                        onClick={() => setSelectedJobId(job.id)}
-                      >
-                        <td className="job-created">{fmtListDate(job.created_at)}</td>
-                        <td className="job-primary">
-                          <div className="job-title">{job.title || job.source_url || "(untitled job)"}</div>
-                          <div className="job-meta-row">
-                            <span className="job-status-chip">{job.status || "unknown"}</span>
-                          </div>
-                        </td>
+            {isJobListVisible && (
+              <article className="card jobs-list-card">
+                <div className="row-between">
+                  <h2>Jobs</h2>
+                  <span className="muted">{jobsLoading ? "Refreshing..." : `${jobs.length} total`}</span>
+                </div>
+                <div className="job-table-wrap">
+                  <table className="job-table">
+                    <thead>
+                      <tr>
+                        <th>Created</th>
+                        <th>Job</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </article>
+                    </thead>
+                    <tbody>
+                      {jobs.map((job) => (
+                        <tr
+                          key={job.id}
+                          className={selectedJobId === job.id ? "selected" : ""}
+                          onClick={() => {
+                            setSelectedJobId(job.id);
+                          }}
+                        >
+                          <td className="job-created">{fmtListDate(job.created_at)}</td>
+                          <td className="job-primary">
+                            <div className="job-title">{displayJobTitle(job)}</div>
+                            <div className="job-meta-row">
+                              <span className="job-status-chip">{job.status || "unknown"}</span>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            )}
 
-            <article className="card job-detail-card">
-              <h2>Job Detail</h2>
+            <article className={`card job-detail-card${isJobListVisible ? "" : " summary-spotlight"}`}>
+              <div className="row-between">
+                <h2>Job Detail</h2>
+              </div>
               {!selectedJobId ? (
                 <p className="muted">Select a job from the table.</p>
               ) : (
                 <div className="job-detail-body">
-                  <div className="detail-grid">
-                    <div>
-                      <div className="muted">Created</div>
-                      <div>{fmtDate(selectedJob?.created_at || selectedJobRow?.created_at)}</div>
-                    </div>
-                    <div>
-                      <div className="muted">Status</div>
-                      <div>{selectedJob?.status || selectedJobRow?.status || "-"}</div>
-                    </div>
-                    <div className="detail-span-2">
-                      <div className="muted">Source URL</div>
-                      <div className="source-url">
-                        {selectedJob?.source_url || selectedJobRow?.source_url ? (
-                          <a
-                            href={selectedJob?.source_url || selectedJobRow?.source_url || "#"}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            {selectedJob?.source_url || selectedJobRow?.source_url}
-                          </a>
-                        ) : (
-                          "-"
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  <details className="debug-disclosure">
-                    <summary>Debug info</summary>
-                    <div className="debug-grid">
-                      <div className="debug-span-2">
-                        <div className="muted">Job ID</div>
-                        <div className="mono">{selectedJobId}</div>
-                      </div>
-                      <div>
-                        <div className="muted">Transcript Source</div>
-                        <div>{selectedJob?.transcript_source || "-"}</div>
-                      </div>
-                      <div>
-                        <div className="muted">Whisper Fallback</div>
-                        <div>
-                          {selectedJob ? (selectedJob.allow_whisper_fallback ? "allowed" : "disabled") : "-"}
-                        </div>
-                      </div>
-                    </div>
-                  </details>
-
+                  <div className="detail-title">{selectedDisplayTitle}</div>
                   {selectedJob?.error && <div className="error">Job error: {selectedJob.error}</div>}
 
                   <div className="job-detail-tabbar" role="tablist" aria-label="Job detail sections">
@@ -755,15 +845,23 @@ export default function App() {
                     <section className="job-detail-tab-panel" aria-label="Summary">
                       {summaryArtifact?.file_link && (
                         <p>
-                          <a href={summaryArtifact.file_link} target="_blank" rel="noreferrer">
+                          <a
+                            href={summaryArtifact.file_link}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(event) => openArtifactLink(event, summaryArtifact.file_link)}
+                          >
                             Open summary file
                           </a>
                         </p>
                       )}
                       {summaryArtifact?.text ? (
-                        <MarkdownBlock text={summaryArtifact.text} className="markdown-panel summary-panel" />
+                        <MarkdownBlock
+                          text={summaryArtifact.text}
+                          className="markdown-panel summary-panel primary-content-panel"
+                        />
                       ) : (
-                        <pre className="summary-panel">(no summary yet)</pre>
+                        <pre className="summary-panel primary-content-panel">(no summary yet)</pre>
                       )}
                     </section>
                   )}
@@ -772,7 +870,12 @@ export default function App() {
                     <section className="job-detail-tab-panel" aria-label="Transcript">
                       {transcriptArtifact?.file_link && (
                         <p>
-                          <a href={transcriptArtifact.file_link} target="_blank" rel="noreferrer">
+                          <a
+                            href={transcriptArtifact.file_link}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(event) => openArtifactLink(event, transcriptArtifact.file_link)}
+                          >
                             Open transcript file
                           </a>
                         </p>
@@ -783,7 +886,7 @@ export default function App() {
 
                   {jobDetailTab === "chat" && (
                     <section className="job-detail-tab-panel" aria-label="Job Chat">
-                      <div className="chat-box">
+                      <div className="chat-box primary-content-panel">
                         {chat.map((msg) => (
                           <div key={msg.id} className={`chat-msg ${msg.role}`}>
                             <div className="chat-role">
@@ -813,6 +916,56 @@ export default function App() {
                       )}
                     </section>
                   )}
+
+                  <section className="job-meta-section" aria-label="Job metadata">
+                    <div className="meta-section-kicker">Job details</div>
+                    <div className="detail-grid">
+                      <div>
+                        <div className="muted">Created</div>
+                        <div>{fmtDate(selectedJob?.created_at || selectedJobRow?.created_at)}</div>
+                      </div>
+                      <div>
+                        <div className="muted">Status</div>
+                        <div>{selectedJob?.status || selectedJobRow?.status || "-"}</div>
+                      </div>
+                      <div className="detail-span-2">
+                        <div className="muted">Source URL</div>
+                        <div className="source-url">
+                          {selectedJob?.source_url || selectedJobRow?.source_url ? (
+                            <a
+                              href={selectedJob?.source_url || selectedJobRow?.source_url || "#"}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {selectedJob?.source_url || selectedJobRow?.source_url}
+                            </a>
+                          ) : (
+                            "-"
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <details className="debug-disclosure">
+                      <summary>Debug info</summary>
+                      <div className="debug-grid">
+                        <div className="debug-span-2">
+                          <div className="muted">Job ID</div>
+                          <div className="mono">{selectedJobId}</div>
+                        </div>
+                        <div>
+                          <div className="muted">Transcript Source</div>
+                          <div>{selectedJob?.transcript_source || "-"}</div>
+                        </div>
+                        <div>
+                          <div className="muted">Whisper Fallback</div>
+                          <div>
+                            {selectedJob ? (selectedJob.allow_whisper_fallback ? "allowed" : "disabled") : "-"}
+                          </div>
+                        </div>
+                      </div>
+                    </details>
+                  </section>
                 </div>
               )}
             </article>
@@ -879,7 +1032,12 @@ export default function App() {
                       {hit.kind} #{hit.chunk_index}
                     </span>
                     {hit.file_link && (
-                      <a href={hit.file_link} target="_blank" rel="noreferrer">
+                      <a
+                        href={hit.file_link}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(event) => openArtifactLink(event, hit.file_link)}
+                      >
                         Open source
                       </a>
                     )}

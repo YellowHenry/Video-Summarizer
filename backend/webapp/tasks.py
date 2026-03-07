@@ -190,7 +190,7 @@ def process_job(job_id: str) -> None:
                             "redeploy the worker, and retry."
                         ) from exc
                     logger.info(
-                        "Caption-first summarization unavailable for job %s; falling back to media download: %s",
+                        "Caption-first summarization unavailable for job %s: %s",
                         job.id,
                         exc,
                     )
@@ -209,6 +209,7 @@ def process_job(job_id: str) -> None:
                             f"YouTube captions unavailable and Whisper fallback is disabled: {exc}",
                         )
                         return
+                    logger.info("Whisper fallback enabled for job %s; switching to media download path.", job.id)
 
             if summarize_result is None:
                 _update_job_status(job, session, "downloading")
