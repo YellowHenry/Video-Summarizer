@@ -1,12 +1,17 @@
-# Audio Summarizer
+# YouLearn Audio Summarizer
 
-A desktop-friendly summarization tool for YouTube videos. Users submit local audio (or video—audio is extracted) files or YouTube URLs; a background worker downloads/ingests the audio, prepares it with ffmpeg, sends it to Whisper for transcription, and summarizes the transcript with a chat model.
+YouLearn is a Google-authenticated web app for turning long YouTube videos or uploaded audio into private AI summaries, transcripts, searchable notes, job chat, and optional email digests. The processing pipeline is intentionally visible: each job moves through `queued`, `downloading`, `preprocessing`, `summarizing`, and `complete` or `failed`, so reviewers and users can understand what the worker is doing.
 
 This repo now supports both:
 - Desktop app (`Tkinter`, legacy path)
 - Web app migration (`FastAPI + React + worker queue`)
 
 The web stack keeps the existing processing modules (`downloader`, `summarizer`, `qa`, `vector_store`) from the legacy python application and wraps them behind APIs.
+
+## Live Google Cloud Deployment
+
+- Web app: [https://audio-summarizer-web-tedb4icw5q-uc.a.run.app](https://audio-summarizer-web-tedb4icw5q-uc.a.run.app)
+- API service: [https://audio-summarizer-api-tedb4icw5q-uc.a.run.app](https://audio-summarizer-api-tedb4icw5q-uc.a.run.app)
 
 ## Tkinter Desktop App (Legacy)
 
@@ -35,6 +40,12 @@ Use this path if you want the local Tkinter UI instead of the web app.
   - `vectors`
 - Auth: Google Sign-In (`/api/auth/me` + bearer token on all data endpoints)
 - Multi-profile isolation: jobs/artifacts/chat/search are scoped by signed-in Google account
+- Optional per-user email digests:
+  - opt-in daily or weekly delivery to the signed-in Google email
+  - first real digest can include older completed jobs from before enable time
+  - later digests are incremental based on the last successful digest window
+  - includes a rolling AI-generated taste/profile summary built from the user's completed jobs, including historical ones
+  - uses Cloud Scheduler -> internal API sweep -> VM worker delivery path
 - Artifact storage:
   - Local (`storage/objects`) by default
   - GCS when `OBJECT_STORAGE_BACKEND=gcs` and `GCS_BUCKET` is set
@@ -60,6 +71,10 @@ Use this path if you want the local Tkinter UI instead of the web app.
 - `GET /api/jobs/{job_id}/chat`
 - `POST /api/jobs/{job_id}/chat`
 - `POST /api/search`
+- `GET /api/digests/settings`
+- `PUT /api/digests/settings`
+- `GET /api/digests/history`
+- `POST /internal/digests/sweep` (internal scheduler trigger)
 
 `POST /api/jobs` returns:
 - `job_id`
@@ -77,7 +92,7 @@ pip install -r requirements.txt
 2. Set env vars:
 ```bash
 # Required for real transcription/summarization/embeddings
-set OPENAI_API_KEY=sk-...
+set OPENAI_API_KEY=replace-with-openai-key
 
 # Required for Google login (backend verifier + frontend client)
 set WEBAPP_GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
@@ -106,6 +121,18 @@ npm run dev
 
 Frontend default URL: `http://localhost:5173`  
 API default URL: `http://localhost:8000`
+
+## Demo Path
+
+1. Sign in with Google.
+2. Submit a YouTube URL.
+3. Watch the Job Detail timeline move through the processing stages.
+4. Open a completed job and review Summary, Transcript, and Job Chat.
+5. Ask a follow-up question in Job Chat.
+6. Use Global Search to ask across saved transcripts.
+7. Open Email Digests to show opt-in daily/weekly recap settings and rolling profile preview.
+
+Failed jobs are intentionally reviewer-friendly: the main panel gives plain-English failure copy and a `Try again` action, while raw provider/yt-dlp detail stays under Debug info.
 
 ### Optional: run without Redis/worker
 
@@ -216,6 +243,19 @@ Set these env vars in Cloud Run:
 - `GCS_BUCKET`
 - `API_BASE_URL`
 - `CORS_ALLOW_ORIGINS`
+- `WEB_APP_BASE_URL`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASSWORD`
+- `SMTP_FROM`
+- `DIGEST_SWEEP_SECRET`
+- `DIGEST_SWEEP_INTERVAL_MINUTES`
+- `DIGEST_PROFILE_MAX_JOBS`
+- `DIGEST_MAX_ITEMS_PER_EMAIL`
+- `DIGEST_JOB_EXCERPT_CHARS`
+- `DIGEST_SEND_HOUR_LOCAL`
+- `DIGEST_WEEKLY_WEEKDAY`
 
 Automated deployment scripts are under `infra/gcp/`:
 - `infra/gcp/bootstrap.sh`
@@ -256,12 +296,32 @@ Example rotating endpoint:
 
 See `infra/gcp/README.md` for required env vars, VPC connector setup, service-account IAM, and deployment sequence.
 
+### Email digests
+
+Signed-in users can opt into daily or weekly email digests from the web UI.
+
+Digest behavior:
+- recipient is always the signed-in Google email
+- daily and weekly are the two supported cadences
+- send time is fixed at `8:00 AM` in the saved local timezone
+- first real digest can include historical completed jobs from before enable time
+- rolling profile already uses historical completed jobs
+- after the first successful digest, later digests are incremental from the last successful digest window
+- empty windows do not send email
+- digest emails deep-link back into the SPA with `?job=<job_id>&tab=summary`
+
+Operational requirements:
+- SMTP must be configured
+- `WEB_APP_BASE_URL` must point at the frontend origin used in email links
+- Cloud Scheduler must be enabled so it can call `/internal/digests/sweep`
+
 ### Online Cost-Optimized Mode (keeps app on, lowers idle cost)
 
 If you want lower daily cost without "turning the app off", the repo now supports a VM-worker cost mode:
 - Keep API/web on Cloud Run and worker on the persistent VM.
 - Run Redis on the worker VM (`REDIS_RUNTIME="worker_vm"`) instead of Memorystore.
 - Downsize Cloud SQL to a shared-core tier (target `SQL_TIER="db-f1-micro"`, fallback `db-g1-small` via helper script).
+- Downsize the worker VM to `e2-small` and shrink the boot disk to `32 GB` for the current low-risk cost floor.
 
 Key config/env knobs:
 - `REDIS_RUNTIME` = `memorystore` or `worker_vm`
@@ -270,7 +330,9 @@ Key config/env knobs:
 - `REDIS_VM_FIREWALL_RULE`
 - `REDIS_VM_ALLOWED_SOURCE` (defaults to `VPC_CONNECTOR_RANGE`)
 - `SQL_TIER` (target tier for `infra/gcp/rightsize_online_costs.sh`)
-- optional `SQL_STORAGE_TYPE` (for example `PD_HDD`, if acceptable)
+- optional `SQL_STORAGE_TYPE` (for example `HDD`, if acceptable)
+- `WORKER_VM_MACHINE_TYPE` (recommended low-risk target: `e2-small`)
+- `WORKER_VM_DISK_SIZE_GB` (recommended low-risk target: `32`)
 
 Why this helps:
 - Managed Redis + always-on Cloud SQL are the main idle cost drivers in low-traffic usage.
@@ -280,6 +342,9 @@ Tradeoffs:
 - VM Redis is cheaper but less managed than Memorystore (you own VM Redis uptime/config).
 - Shared-core Cloud SQL is slower than custom tiers, but often fine for small personal traffic.
 - `infra/gcp/pause_stack.sh` / `resume_stack.sh` still exist as optional "idle mode" controls; they are not required for this online cost-reduction mode.
+- After VM downsizing + shared-core SQL + VM Redis, the likely remaining always-on floor is the Serverless VPC connector used by Cloud Run API -> VM Redis. If a 72-hour average still stays above roughly `$0.90/day`, the next savings step is an architecture change rather than another config tweak.
+- Note: GCE boot disks cannot be shrunk in place. `WORKER_VM_DISK_SIZE_GB="32"` applies automatically to future VM creations; reducing an existing `64 GB` worker disk requires a rebuild/recreate step if you want that savings live.
+- Note: Cloud SQL storage type is often immutable after creation. If your existing instance rejects an `SQL_STORAGE_TYPE="HDD"` patch, keep the shared-core tier and treat disk-type savings as a recreate-time option rather than an in-place optimization.
 
 ## What Is Still Manual (By Design)
 

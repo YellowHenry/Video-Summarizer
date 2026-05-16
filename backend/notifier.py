@@ -27,18 +27,13 @@ class Notifier:
         self.config = config or NotifierConfig()
         self.logger = logging.getLogger(__name__)
 
-    def notify(self, to_email: Optional[str], subject: str, body: str) -> None:
-        if not to_email:
-            return
-        if not self.config.smtp_host or not self.config.from_email:
-            self.logger.info("Skipping email notification; SMTP not configured")
-            return
+    def is_configured(self) -> bool:
+        return bool(self.config.smtp_host and self.config.from_email)
 
-        message = EmailMessage()
-        message["From"] = self.config.from_email
-        message["To"] = to_email
-        message["Subject"] = subject
-        message.set_content(body)
+    def _send_message(self, message: EmailMessage, to_email: str) -> bool:
+        if not self.is_configured():
+            self.logger.info("Skipping email notification; SMTP not configured")
+            return False
 
         try:
             with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=20) as smtp:
@@ -47,5 +42,30 @@ class Notifier:
                     smtp.login(self.config.smtp_user, self.config.smtp_password)
                 smtp.send_message(message)
             self.logger.info("Notification email sent to %s", to_email)
+            return True
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("Failed to send notification to %s: %s", to_email, exc)
+            return False
+
+    def notify(self, to_email: Optional[str], subject: str, body: str) -> bool:
+        if not to_email:
+            return False
+
+        message = EmailMessage()
+        message["From"] = self.config.from_email
+        message["To"] = to_email
+        message["Subject"] = subject
+        message.set_content(body)
+        return self._send_message(message, to_email)
+
+    def notify_digest(self, to_email: Optional[str], subject: str, text_body: str, html_body: str) -> bool:
+        if not to_email:
+            return False
+
+        message = EmailMessage()
+        message["From"] = self.config.from_email
+        message["To"] = to_email
+        message["Subject"] = subject
+        message.set_content(text_body)
+        message.add_alternative(html_body, subtype="html")
+        return self._send_message(message, to_email)

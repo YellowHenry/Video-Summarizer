@@ -91,6 +91,11 @@ class SummarizerConfig:
     job_chat_max_tokens: int = int(os.getenv("JOB_CHAT_MAX_TOKENS", "1500"))
     job_chat_auto_continue_enabled: bool = _env_bool("JOB_CHAT_AUTO_CONTINUE_ENABLED", True)
     job_chat_auto_continue_max_segments: int = int(os.getenv("JOB_CHAT_AUTO_CONTINUE_MAX_SEGMENTS", "4"))
+    digest_profile_max_jobs: int = int(os.getenv("DIGEST_PROFILE_MAX_JOBS", "20"))
+    digest_max_items_per_email: int = int(os.getenv("DIGEST_MAX_ITEMS_PER_EMAIL", "10"))
+    digest_job_excerpt_chars: int = int(os.getenv("DIGEST_JOB_EXCERPT_CHARS", "240"))
+    digest_profile_max_tokens: int = int(os.getenv("DIGEST_PROFILE_MAX_TOKENS", "350"))
+    digest_overview_max_tokens: int = int(os.getenv("DIGEST_OVERVIEW_MAX_TOKENS", "500"))
     chunk_duration_seconds: int = int(os.getenv("SUMMARIZER_CHUNK_SECONDS", str(42 * 60)))  # default 42 minutes
     whisper_upload_limit_bytes: int = int(os.getenv("SUMMARIZER_WHISPER_LIMIT_BYTES", str(25 * 1024 * 1024)))
     openai_trust_env_proxy: bool = _env_bool("OPENAI_TRUST_ENV_PROXY", False)
@@ -104,6 +109,23 @@ class SummarizeResult:
     captions_attempted: bool = False
     captions_status: Optional[str] = None
     captions_detail: Optional[str] = None
+
+
+@dataclass
+class DigestJobInput:
+    title: str
+    source_url: Optional[str]
+    source_type: str
+    transcript_source: Optional[str]
+    summary_excerpt: str
+    completed_at: Optional[str]
+
+
+@dataclass
+class DigestOverview:
+    intro: str
+    highlights: list[str]
+    profile_note: Optional[str] = None
 
 
 class CloudSummarizerClient:
@@ -718,6 +740,128 @@ class CloudSummarizerClient:
                 self.config.max_tokens,
             )
         return choice.message.content.strip()
+
+    def build_user_digest_profile(self, job_inputs: list[DigestJobInput]) -> str:
+        jobs = job_inputs[: max(1, self.config.digest_profile_max_jobs)]
+        if not jobs:
+            return "Your digest profile will appear after you complete a few jobs."
+        if not self.client:
+            return self._fallback_digest_profile(jobs)
+
+        bullets = []
+        for idx, job in enumerate(jobs, start=1):
+            bullets.append(
+                (
+                    f"{idx}. title={job.title}\n"
+                    f"   source_type={job.source_type}\n"
+                    f"   transcript_source={job.transcript_source or 'unknown'}\n"
+                    f"   completed_at={job.completed_at or 'unknown'}\n"
+                    f"   summary_excerpt={job.summary_excerpt}"
+                )
+            )
+        prompt = (
+            "You are writing a rolling taste profile for one user based on their recently summarized media.\n"
+            "Write 3 to 5 concise sentences. Identify recurring interests, subject areas, tone preferences, "
+            "and patterns in what they choose to summarize. Keep it helpful, non-judgmental, and plain text.\n\n"
+            "Recent jobs:\n"
+            + "\n".join(bullets)
+        )
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=self.config.digest_profile_max_tokens,
+            )
+            text = completion.choices[0].message.content.strip()
+            return text or self._fallback_digest_profile(jobs)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Digest profile generation failed; using fallback: %s", exc)
+            return self._fallback_digest_profile(jobs)
+
+    def build_digest_overview(
+        self,
+        job_inputs: list[DigestJobInput],
+        cadence: str,
+        profile_summary: str | None,
+    ) -> DigestOverview:
+        jobs = job_inputs[: max(1, self.config.digest_max_items_per_email)]
+        if not jobs:
+            return DigestOverview(intro="No new completed jobs were found in this digest window.", highlights=[], profile_note=None)
+        if not self.client:
+            return self._fallback_digest_overview(jobs, cadence, profile_summary)
+
+        payload = [
+            {
+                "title": job.title,
+                "source_type": job.source_type,
+                "transcript_source": job.transcript_source,
+                "completed_at": job.completed_at,
+                "summary_excerpt": job.summary_excerpt,
+            }
+            for job in jobs
+        ]
+        prompt = (
+            "Return strict JSON only with keys intro, highlights, profile_note.\n"
+            "intro: one short paragraph.\n"
+            "highlights: array of up to 3 short bullet strings.\n"
+            "profile_note: one short sentence connecting this digest to the user's broader taste profile.\n"
+            f"cadence={cadence}\n"
+            f"profile_summary={profile_summary or ''}\n"
+            f"jobs={json.dumps(payload, ensure_ascii=False)}"
+        )
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=self.config.digest_overview_max_tokens,
+            )
+            raw = completion.choices[0].message.content.strip()
+            parsed = json.loads(raw)
+            intro = str(parsed.get("intro") or "").strip()
+            highlights = [str(item).strip() for item in parsed.get("highlights") or [] if str(item).strip()]
+            profile_note = str(parsed.get("profile_note") or "").strip() or None
+            if intro:
+                return DigestOverview(intro=intro, highlights=highlights[:3], profile_note=profile_note)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Digest overview generation failed; using fallback: %s", exc)
+        return self._fallback_digest_overview(jobs, cadence, profile_summary)
+
+    def _fallback_digest_profile(self, job_inputs: list[DigestJobInput]) -> str:
+        topics: list[str] = []
+        for job in job_inputs:
+            title = (job.title or "").strip()
+            if not title:
+                continue
+            topics.append(title)
+        if not topics:
+            return "Your recent activity suggests a broad mix of topics, with more signal coming as you complete additional jobs."
+        unique_topics = topics[:3]
+        return (
+            "Your recent summaries suggest recurring interest in "
+            + ", ".join(unique_topics)
+            + ". You appear to favor content that is information-dense enough to revisit later, "
+            "with a mix of practical takeaways and topic exploration."
+        )
+
+    def _fallback_digest_overview(
+        self,
+        job_inputs: list[DigestJobInput],
+        cadence: str,
+        profile_summary: str | None,
+    ) -> DigestOverview:
+        titles = [job.title for job in job_inputs if job.title][:3]
+        cadence_label = "daily" if cadence == "daily" else "weekly"
+        intro = (
+            f"Here is your {cadence_label} recap covering {len(job_inputs)} newly completed summar"
+            + ("y." if len(job_inputs) == 1 else "ies.")
+        )
+        highlights = [f"Completed: {title}" for title in titles]
+        profile_note = None
+        if profile_summary:
+            profile_note = "This batch fits the broader interests reflected in your recent listening and viewing profile."
+        return DigestOverview(intro=intro, highlights=highlights, profile_note=profile_note)
 
     def _fetch_youtube_captions(self, url: str) -> tuple[Optional[str], Optional[str], str, Optional[str]]:
         """

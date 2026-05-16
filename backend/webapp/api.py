@@ -1,16 +1,21 @@
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend.notifier import Notifier
+
 from .auth import AuthUser, owner_key_from_email, require_user
+from .artifacts import load_text_artifact
 from .config import settings
 from .db import SessionLocal
+from .digest_tasks import compute_next_send_at, enqueue_digest_sweep, normalize_timezone
 from .logging_config import configure_logging
 from .metadata_store import MetadataStore, NewJobParams
 from .migrate import run_migrations
@@ -27,6 +32,8 @@ from .schemas import (
     ChatResponse,
     CreateJobResponse,
     CreateJobRequest,
+    DigestRunOut,
+    DigestSettingsResponse,
     JobDetail,
     JobSummary,
     PresignUploadRequest,
@@ -34,6 +41,7 @@ from .schemas import (
     SearchHit,
     SearchRequest,
     SearchResponse,
+    UpdateDigestSettingsRequest,
 )
 from .title_resolver import looks_like_url, resolve_display_title
 
@@ -150,6 +158,36 @@ def _resolve_job_title_for_response(job: JobRecord, *, allow_oembed: bool) -> tu
     return resolved_title, source, should_persist
 
 
+def _digest_delivery_status() -> tuple[bool, str | None]:
+    notifier = Notifier()
+    if not notifier.is_configured():
+        return False, "SMTP is not configured"
+    if not settings.web_app_base_url.strip():
+        return False, "WEB_APP_BASE_URL is not configured"
+    return True, None
+
+
+def _build_digest_settings_response(current_user: AuthUser, pref) -> DigestSettingsResponse:
+    delivery_available, delivery_reason = _digest_delivery_status()
+    return DigestSettingsResponse(
+        enabled=bool(pref.enabled) if pref else False,
+        cadence=(pref.cadence if pref else "daily"),
+        timezone=(pref.timezone_name if pref else "UTC"),
+        send_hour_local=int(pref.send_hour_local if pref else settings.digest_send_hour_local),
+        weekly_weekday=int(pref.weekly_weekday if pref else settings.digest_weekly_weekday),
+        recipient_email=_normalize_owner_email(current_user.email),
+        delivery_available=delivery_available,
+        delivery_reason=delivery_reason,
+        next_send_at=pref.next_send_at if pref else None,
+        last_run_at=pref.last_run_at if pref else None,
+        last_run_status=pref.last_run_status if pref else None,
+        last_sent_at=pref.last_sent_at if pref else None,
+        profile_summary=pref.profile_summary if pref else None,
+        profile_updated_at=pref.profile_updated_at if pref else None,
+        historical_backfill_pending=bool(pref.include_historical_on_next_send) if pref else False,
+    )
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"ok": True}
@@ -158,6 +196,104 @@ def healthz() -> dict:
 @app.get("/api/auth/me", response_model=AuthMeResponse)
 def auth_me(current_user: AuthUser = Depends(require_user)) -> AuthMeResponse:
     return AuthMeResponse(email=current_user.email, name=current_user.name, picture=current_user.picture)
+
+
+@app.get("/api/digests/settings", response_model=DigestSettingsResponse)
+def get_digest_settings(
+    metadata: MetadataStore = Depends(get_metadata_store),
+    current_user: AuthUser = Depends(require_user),
+) -> DigestSettingsResponse:
+    pref = metadata.get_digest_preference(_normalize_owner_email(current_user.email))
+    return _build_digest_settings_response(current_user, pref)
+
+
+@app.put("/api/digests/settings", response_model=DigestSettingsResponse)
+def update_digest_settings(
+    payload: UpdateDigestSettingsRequest,
+    metadata: MetadataStore = Depends(get_metadata_store),
+    current_user: AuthUser = Depends(require_user),
+) -> DigestSettingsResponse:
+    delivery_available, delivery_reason = _digest_delivery_status()
+    if payload.enabled and not delivery_available:
+        raise HTTPException(status_code=400, detail=delivery_reason or "Digest delivery is unavailable")
+
+    owner_email = _normalize_owner_email(current_user.email)
+    now = datetime.now(timezone.utc)
+    pref = metadata.get_digest_preference(owner_email)
+    timezone_name = normalize_timezone(payload.timezone)
+    cadence = payload.cadence
+    display_name = (current_user.name or (pref.display_name if pref else "") or current_user.email).strip() or owner_email
+    last_digest_cutoff_at = pref.last_digest_cutoff_at if pref else None
+    next_send_at = pref.next_send_at if pref else None
+    include_historical_on_next_send = bool(pref.include_historical_on_next_send) if pref else False
+
+    if payload.enabled:
+        if not pref:
+            last_digest_cutoff_at = None
+            include_historical_on_next_send = True
+        next_send_at = compute_next_send_at(
+            cadence,
+            timezone_name,
+            now,
+            send_hour_local=settings.digest_send_hour_local,
+            weekly_weekday=settings.digest_weekly_weekday,
+        )
+    else:
+        next_send_at = None
+
+    saved = metadata.upsert_digest_preference(
+        owner_email,
+        enabled=payload.enabled,
+        cadence=cadence,
+        timezone_name=timezone_name,
+        send_hour_local=settings.digest_send_hour_local,
+        weekly_weekday=settings.digest_weekly_weekday,
+        display_name=display_name,
+        last_digest_cutoff_at=last_digest_cutoff_at,
+        last_run_at=pref.last_run_at if pref else None,
+        last_run_status=pref.last_run_status if pref else None,
+        last_sent_at=pref.last_sent_at if pref else None,
+        next_send_at=next_send_at,
+        profile_summary=pref.profile_summary if pref else None,
+        profile_updated_at=pref.profile_updated_at if pref else None,
+        include_historical_on_next_send=include_historical_on_next_send,
+    )
+    return _build_digest_settings_response(current_user, saved)
+
+
+@app.get("/api/digests/history", response_model=list[DigestRunOut])
+def get_digest_history(
+    metadata: MetadataStore = Depends(get_metadata_store),
+    current_user: AuthUser = Depends(require_user),
+) -> list[DigestRunOut]:
+    rows = metadata.list_digest_runs(_normalize_owner_email(current_user.email), limit=5)
+    return [
+        DigestRunOut(
+            id=row.id,
+            status=row.status,
+            cadence=row.cadence,
+            job_count=row.job_count,
+            subject=row.subject,
+            window_start_at=row.window_start_at,
+            window_end_at=row.window_end_at,
+            created_at=row.created_at,
+            sent_at=row.sent_at,
+        )
+        for row in rows
+    ]
+
+
+@app.post("/internal/digests/sweep")
+def queue_digest_sweep(
+    x_capstone_digest_secret: str | None = Header(default=None, alias="X-Capstone-Digest-Secret"),
+) -> dict:
+    configured_secret = settings.digest_sweep_secret.strip()
+    if not configured_secret:
+        raise HTTPException(status_code=503, detail="DIGEST_SWEEP_SECRET is not configured")
+    if not x_capstone_digest_secret or x_capstone_digest_secret != configured_secret:
+        raise HTTPException(status_code=401, detail="Invalid digest sweep secret")
+    rq_job_id = enqueue_digest_sweep()
+    return {"queued": True, "job_id": rq_job_id}
 
 
 @app.post("/api/uploads/presign", response_model=PresignUploadResponse)
@@ -306,44 +442,15 @@ def get_job(
     return _job_to_detail(job, resolved_title=resolved_title)
 
 
-def _artifact_from_job(
-    job_id: str,
-    object_key: str | None,
-    local_filename: str,
-    metadata: MetadataStore | None = None,
-) -> ArtifactResponse:
+def _artifact_response_from_job(job: JobRecord, kind: str, metadata: MetadataStore) -> ArtifactResponse:
     services = get_service_container()
     object_store = services.object_store
-    if object_key and object_store.exists(object_key):
-        text = object_store.get_text(object_key)
-        if metadata:
-            metadata.upsert_artifact(
-                job_id,
-                local_filename.replace(".txt", ""),
-                object_key,
-                size_bytes=len(text.encode("utf-8")),
-                content_type="text/plain; charset=utf-8",
-            )
-        file_link = object_store.generate_download_url(object_key, settings.download_url_expiry_seconds)
-        return ArtifactResponse(text=text, object_key=object_key, file_link=file_link)
-
-    local_path = Path("storage") / job_id / local_filename
-    if local_path.exists():
-        text = local_path.read_text(encoding="utf-8")
-        fallback_object_key = f"jobs/{job_id}/{local_filename}"
-        if not object_store.exists(fallback_object_key):
-            object_store.put_text(fallback_object_key, text)
-        if metadata:
-            metadata.upsert_artifact(
-                job_id,
-                local_filename.replace(".txt", ""),
-                fallback_object_key,
-                size_bytes=len(text.encode("utf-8")),
-                content_type="text/plain; charset=utf-8",
-            )
-        file_link = object_store.generate_download_url(fallback_object_key, settings.download_url_expiry_seconds)
-        return ArtifactResponse(text=text, object_key=fallback_object_key, file_link=file_link)
-    raise HTTPException(status_code=404, detail=f"{local_filename} not found")
+    try:
+        text, object_key = load_text_artifact(job, kind, metadata, object_store)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    file_link = object_store.generate_download_url(object_key, settings.download_url_expiry_seconds) if object_key else None
+    return ArtifactResponse(text=text, object_key=object_key, file_link=file_link)
 
 
 @app.get("/api/jobs/{job_id}/summary", response_model=ArtifactResponse)
@@ -356,7 +463,7 @@ def get_summary(
     job = metadata.get_job(job_id, _normalize_owner_email(current_user.email))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return _artifact_from_job(job_id, job.summary_object_key, "summary.txt", metadata=metadata)
+    return _artifact_response_from_job(job, "summary", metadata)
 
 
 @app.get("/api/jobs/{job_id}/transcript", response_model=ArtifactResponse)
@@ -369,7 +476,7 @@ def get_transcript(
     job = metadata.get_job(job_id, _normalize_owner_email(current_user.email))
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return _artifact_from_job(job_id, job.transcript_object_key, "transcript.txt", metadata=metadata)
+    return _artifact_response_from_job(job, "transcript", metadata)
 
 
 @app.get("/api/jobs/{job_id}/chat", response_model=ChatResponse)
@@ -403,10 +510,10 @@ def post_job_chat(
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
 
-    transcript = _artifact_from_job(job_id, job.transcript_object_key, "transcript.txt", metadata=metadata).text
+    transcript = _artifact_response_from_job(job, "transcript", metadata).text
     summary_text = None
     try:
-        summary_text = _artifact_from_job(job_id, job.summary_object_key, "summary.txt", metadata=metadata).text
+        summary_text = _artifact_response_from_job(job, "summary", metadata).text
     except HTTPException:
         summary_text = None
 

@@ -55,6 +55,14 @@ class WebSettings:
     webapp_disable_auth: bool = _env_bool("WEBAPP_DISABLE_AUTH", False)
     webapp_dev_user_email: str = os.getenv("WEBAPP_DEV_USER_EMAIL", "dev@example.com")
     legacy_jobs_owner_email: str = os.getenv("LEGACY_JOBS_OWNER_EMAIL", "danmcneary8@gmail.com")
+    web_app_base_url: str = os.getenv("WEB_APP_BASE_URL", "http://localhost:5173").strip()
+    digest_sweep_secret: str = os.getenv("DIGEST_SWEEP_SECRET", "").strip()
+    digest_sweep_interval_minutes: int = int(os.getenv("DIGEST_SWEEP_INTERVAL_MINUTES", "15"))
+    digest_profile_max_jobs: int = int(os.getenv("DIGEST_PROFILE_MAX_JOBS", "20"))
+    digest_max_items_per_email: int = int(os.getenv("DIGEST_MAX_ITEMS_PER_EMAIL", "10"))
+    digest_job_excerpt_chars: int = int(os.getenv("DIGEST_JOB_EXCERPT_CHARS", "240"))
+    digest_send_hour_local: int = int(os.getenv("DIGEST_SEND_HOUR_LOCAL", "8"))
+    digest_weekly_weekday: int = int(os.getenv("DIGEST_WEEKLY_WEEKDAY", "0"))
 
 
 settings = WebSettings()

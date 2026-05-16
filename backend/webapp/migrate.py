@@ -95,6 +95,112 @@ def _ensure_owner_email_column(conn, dialect: str) -> None:
         logger.warning("Failed to migrate jobs.owner_email column: %s", exc)
 
 
+def _ensure_completed_at_column(conn, dialect: str) -> None:
+    """Add jobs.completed_at and backfill historical complete rows."""
+    try:
+        if dialect == "postgresql":
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE jobs
+                    SET completed_at = updated_at
+                    WHERE status = 'complete'
+                      AND completed_at IS NULL
+                    """
+                )
+            )
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at)"))
+            return
+
+        if dialect == "sqlite":
+            rows = conn.execute(text("PRAGMA table_info(jobs)")).mappings().all()
+            column_names = {str(row.get("name")) for row in rows}
+            if "completed_at" not in column_names:
+                conn.execute(text("ALTER TABLE jobs ADD COLUMN completed_at TIMESTAMP"))
+            conn.execute(
+                text(
+                    """
+                    UPDATE jobs
+                    SET completed_at = updated_at
+                    WHERE status = 'complete'
+                      AND completed_at IS NULL
+                    """
+                )
+            )
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at)"))
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to migrate jobs.completed_at column: %s", exc)
+
+
+def _ensure_digest_backfill_column(conn, dialect: str) -> None:
+    """Add digest_preferences.include_historical_on_next_send and backfill legacy rows."""
+    try:
+        if dialect == "postgresql":
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE digest_preferences
+                    ADD COLUMN IF NOT EXISTS include_historical_on_next_send BOOLEAN DEFAULT FALSE
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE digest_preferences
+                    SET include_historical_on_next_send = FALSE
+                    WHERE include_historical_on_next_send IS NULL
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE digest_preferences
+                    SET include_historical_on_next_send = TRUE
+                    WHERE last_sent_at IS NULL
+                    """
+                )
+            )
+            return
+
+        if dialect == "sqlite":
+            rows = conn.execute(text("PRAGMA table_info(digest_preferences)")).mappings().all()
+            column_names = {str(row.get("name")) for row in rows}
+            if "include_historical_on_next_send" not in column_names:
+                conn.execute(
+                    text(
+                        """
+                        ALTER TABLE digest_preferences
+                        ADD COLUMN include_historical_on_next_send BOOLEAN DEFAULT 0
+                        """
+                    )
+                )
+            conn.execute(
+                text(
+                    """
+                    UPDATE digest_preferences
+                    SET include_historical_on_next_send = 0
+                    WHERE include_historical_on_next_send IS NULL
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE digest_preferences
+                    SET include_historical_on_next_send = 1
+                    WHERE last_sent_at IS NULL
+                    """
+                )
+            )
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to migrate digest_preferences.include_historical_on_next_send column: %s", exc)
+
+
 def run_migrations() -> None:
     """
     Minimal migration entrypoint:
@@ -108,6 +214,8 @@ def run_migrations() -> None:
 
         _ensure_allow_whisper_fallback_column(conn, dialect)
         _ensure_owner_email_column(conn, dialect)
+        _ensure_completed_at_column(conn, dialect)
+        _ensure_digest_backfill_column(conn, dialect)
 
     with engine.begin() as conn:
         dialect = conn.dialect.name

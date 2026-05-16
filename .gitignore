@@ -26,18 +26,34 @@ web/.vite/
 web/.auth/
 web/playwright-report/
 web/test-results/
+web/playwright-inspection/
 
 # Local runtime/output
 storage/
 *.log
 tmp/
 temp/
+.playwright-mcp/
+ps_run_command.txt
 
 # Local env/secrets
 .env
 .env.*
 !.env.example
 infra/gcp/env.sh
+
+# Personal/demo scratch artifacts
+resume_*.tex
+resume_*.pdf
+resume_*.png
+resume_*.jpg
+resume_*.aux
+resume_*.out
+resume_current_base64.txt
+resume_current_jpg_base64.txt
+capstone-home.png
+web/edge-cdp-inspection.png
+web/production-signed-in.png
 
 # Editor/OS noise
 .vscode/

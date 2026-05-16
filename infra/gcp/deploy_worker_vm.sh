@@ -23,7 +23,22 @@ resolve_openai_api_key() {
   fi
 }
 
-resolve_openai_api_key
+validate_openai_api_key() {
+  local code=""
+  local out_file
+  out_file="$(mktemp /tmp/capstone-openai-key-check.XXXXXX)"
+  code="$(
+    curl -sS -o "${out_file}" -w "%{http_code}" \
+      -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+      https://api.openai.com/v1/models || true
+  )"
+  rm -f "${out_file}" >/dev/null 2>&1 || true
+  if [[ "${code}" != "200" ]]; then
+    echo "OpenAI API key validation failed before worker deploy (HTTP ${code})." >&2
+    echo "Update Secret Manager secret '${OPENAI_SECRET_NAME:-openai-api-key}' or clear stale local OPENAI_API_KEY, then retry." >&2
+    exit 1
+  fi
+}
 
 : "${PROJECT_ID:?PROJECT_ID is required}"
 : "${REGION:?REGION is required}"
@@ -33,7 +48,18 @@ resolve_openai_api_key
 : "${DB_PASSWORD:?DB_PASSWORD is required}"
 : "${REDIS_RUNTIME:=memorystore}"
 : "${BUCKET_NAME:?BUCKET_NAME is required}"
-: "${OPENAI_API_KEY:?OPENAI_API_KEY is required (or set backend/config.py OPENAI_API_KEY)}"
+: "${OPENAI_SECRET_NAME:=}"
+if [[ -z "${OPENAI_SECRET_NAME}" ]]; then
+  resolve_openai_api_key
+else
+  # When a Secret Manager binding is configured, it is the production source of
+  # truth. Always read it here so stale local shell variables cannot overwrite
+  # the worker VM environment during deploy.
+  OPENAI_API_KEY="$(gcloud secrets versions access latest --secret="${OPENAI_SECRET_NAME}")"
+  export OPENAI_API_KEY
+fi
+: "${OPENAI_API_KEY:?OPENAI_API_KEY or OPENAI_SECRET_NAME is required}"
+validate_openai_api_key
 : "${OPENAI_TRUST_ENV_PROXY:=false}"
 : "${SUMMARIZER_MAX_TOKENS:=800}"
 : "${WORKER_VM_NAME:=audio-summarizer-worker-vm}"
@@ -48,9 +74,22 @@ resolve_openai_api_key
 : "${WORKER_SERVICE:=audio-summarizer-worker}"
 : "${DISABLE_CLOUD_RUN_WORKER:=true}"
 : "${CLOUD_RUN_SHADOW_QUEUE:=cloudrun-disabled}"
+: "${WEB_SERVICE:=audio-summarizer-web}"
 : "${WEBAPP_ENABLE_PGVECTOR:=true}"
 : "${RQ_RETRY_MAX:=3}"
 : "${RQ_RETRY_INTERVALS:=30,120,300}"
+: "${WEB_APP_BASE_URL:=}"
+: "${DIGEST_SWEEP_INTERVAL_MINUTES:=15}"
+: "${DIGEST_PROFILE_MAX_JOBS:=20}"
+: "${DIGEST_MAX_ITEMS_PER_EMAIL:=10}"
+: "${DIGEST_JOB_EXCERPT_CHARS:=240}"
+: "${DIGEST_SEND_HOUR_LOCAL:=8}"
+: "${DIGEST_WEEKLY_WEEKDAY:=0}"
+: "${SMTP_HOST:=}"
+: "${SMTP_PORT:=587}"
+: "${SMTP_USER:=}"
+: "${SMTP_PASSWORD:=}"
+: "${SMTP_FROM:=}"
 : "${YTDLP_STRICT_COOKIES:=true}"
 : "${YOUTUBE_TRANSCRIPT_API_FALLBACK:=false}"
 : "${YTDLP_COOKIES_FROM_BROWSER:=chrome}"
@@ -88,7 +127,7 @@ INSTANCE_CONN="${PROJECT_ID}:${REGION}:${CLOUD_SQL_INSTANCE}"
 WORKER_VM_INTERNAL_IP="$(gcloud compute instances describe "${WORKER_VM_NAME}" --zone "${WORKER_VM_ZONE}" --format='value(networkInterfaces[0].networkIP)')"
 REDIS_URL="redis://localhost:6379/0"
 REDIS_CONF_FILE=""
-REMOTE_REDIS_CONF="/tmp/capstone-redis.conf"
+REMOTE_REDIS_CONF="/tmp/capstone-redis-$(date +%s)-$$.conf"
 
 if [[ "${REDIS_RUNTIME}" == "worker_vm" ]]; then
   : "${REDIS_VM_REQUIREPASS:?REDIS_VM_REQUIREPASS is required when REDIS_RUNTIME=worker_vm}"
@@ -127,10 +166,14 @@ else
   REDIS_URL="redis://${REDIS_HOST}:6379/0"
 fi
 
+if [[ -z "${WEB_APP_BASE_URL}" ]]; then
+  WEB_APP_BASE_URL="$(gcloud run services describe "${WEB_SERVICE}" --region "${REGION}" --format='value(status.url)' 2>/dev/null || true)"
+fi
+
 SRC_TAR="$(mktemp /tmp/capstone-worker-src.XXXXXX.tgz)"
 ENV_FILE="$(mktemp /tmp/capstone-worker-env.XXXXXX)"
-REMOTE_TAR="/tmp/capstone-worker-src.tgz"
-REMOTE_ENV="/tmp/capstone-worker.env"
+REMOTE_TAR="/tmp/capstone-worker-src-$(date +%s)-$$.tgz"
+REMOTE_ENV="/tmp/capstone-worker-$(date +%s)-$$.env"
 
 cleanup() {
   rm -f "${SRC_TAR}" "${ENV_FILE}" >/dev/null 2>&1 || true
@@ -155,6 +198,11 @@ DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASSWORD}@/${DB_NAME}?host=/cl
 REDIS_URL=${REDIS_URL}
 OBJECT_STORAGE_BACKEND=gcs
 GCS_BUCKET=${BUCKET_NAME}
+GOOGLE_CLOUD_PROJECT=${PROJECT_ID}
+# Leave quota-project unset: the worker VM service account doesn't need
+# user-project billing overrides for GCS, and setting one forces
+# serviceusage.services.use checks that can break artifact writes.
+GCE_METADATA_MTLS_MODE=none
 OPENAI_API_KEY=${OPENAI_API_KEY}
 OPENAI_TRUST_ENV_PROXY=${OPENAI_TRUST_ENV_PROXY}
 SUMMARIZER_MAX_TOKENS=${SUMMARIZER_MAX_TOKENS}
@@ -162,6 +210,13 @@ RQ_QUEUE_NAME=jobs
 RQ_RETRY_MAX=${RQ_RETRY_MAX}
 RQ_RETRY_INTERVALS=${RQ_RETRY_INTERVALS}
 WEBAPP_ENABLE_PGVECTOR=${WEBAPP_ENABLE_PGVECTOR}
+WEB_APP_BASE_URL=${WEB_APP_BASE_URL}
+DIGEST_SWEEP_INTERVAL_MINUTES=${DIGEST_SWEEP_INTERVAL_MINUTES}
+DIGEST_PROFILE_MAX_JOBS=${DIGEST_PROFILE_MAX_JOBS}
+DIGEST_MAX_ITEMS_PER_EMAIL=${DIGEST_MAX_ITEMS_PER_EMAIL}
+DIGEST_JOB_EXCERPT_CHARS=${DIGEST_JOB_EXCERPT_CHARS}
+DIGEST_SEND_HOUR_LOCAL=${DIGEST_SEND_HOUR_LOCAL}
+DIGEST_WEEKLY_WEEKDAY=${DIGEST_WEEKLY_WEEKDAY}
 YTDLP_STRICT_COOKIES=${YTDLP_STRICT_COOKIES}
 YOUTUBE_TRANSCRIPT_API_FALLBACK=${YOUTUBE_TRANSCRIPT_API_FALLBACK}
 YTDLP_COOKIES_FROM_BROWSER=${YTDLP_COOKIES_FROM_BROWSER}
@@ -179,14 +234,40 @@ PROXY_AUTOGENERATE_START=${PROXY_AUTOGENERATE_START}
 PROXY_AUTOGENERATE_END=${PROXY_AUTOGENERATE_END}
 EOF
 
+write_env_var() {
+  local name="$1"
+  local value="$2"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '%s="%s"\n' "${name}" "${value}" >>"${ENV_FILE}"
+}
+
+if [[ -n "${SMTP_HOST:-}" ]]; then
+  write_env_var "SMTP_HOST" "${SMTP_HOST}"
+fi
+if [[ -n "${SMTP_PORT:-}" ]]; then
+  write_env_var "SMTP_PORT" "${SMTP_PORT}"
+fi
+if [[ -n "${SMTP_USER:-}" ]]; then
+  write_env_var "SMTP_USER" "${SMTP_USER}"
+fi
+if [[ -n "${SMTP_PASSWORD:-}" ]]; then
+  write_env_var "SMTP_PASSWORD" "${SMTP_PASSWORD}"
+fi
+if [[ -n "${SMTP_FROM:-}" ]]; then
+  write_env_var "SMTP_FROM" "${SMTP_FROM}"
+fi
+
 if [[ -n "${YTDLP_COOKIES:-}" ]]; then
-  echo "YTDLP_COOKIES=${YTDLP_COOKIES}" >>"${ENV_FILE}"
+  write_env_var "YTDLP_COOKIES" "${YTDLP_COOKIES}"
 fi
 if [[ -n "${YTDLP_COOKIES_TEXT:-}" ]]; then
-  echo "YTDLP_COOKIES_TEXT=${YTDLP_COOKIES_TEXT}" >>"${ENV_FILE}"
+  write_env_var "YTDLP_COOKIES_TEXT" "${YTDLP_COOKIES_TEXT}"
 fi
 if [[ -n "${YTDLP_COOKIES_B64:-}" ]]; then
-  echo "YTDLP_COOKIES_B64=${YTDLP_COOKIES_B64}" >>"${ENV_FILE}"
+  write_env_var "YTDLP_COOKIES_B64" "${YTDLP_COOKIES_B64}"
 fi
 if [[ "${PROXY_ENABLED,,}" == "true" ]]; then
   # Intentionally do NOT export global HTTP(S)_PROXY / ALL_PROXY into the worker runtime.
@@ -194,7 +275,7 @@ if [[ "${PROXY_ENABLED,,}" == "true" ]]; then
   # Keeping global proxy env vars out of worker.env prevents non-caption traffic
   # (for example GCS uploads, metadata calls) from being sent through residential proxies.
   if [[ -n "${PROXY_POOL:-}" ]]; then
-    echo "PROXY_POOL=${PROXY_POOL}" >>"${ENV_FILE}"
+    write_env_var "PROXY_POOL" "${PROXY_POOL}"
   fi
 fi
 

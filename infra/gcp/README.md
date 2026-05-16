@@ -8,6 +8,7 @@ This folder contains deployment scripts for the web migration stack:
 - Redis queue (Memorystore or Redis on the worker VM)
 - GCS artifact bucket
 - Optional Cloud Run domain mapping (managed HTTPS)
+- Optional per-user email digests (Cloud Scheduler -> API sweep endpoint -> VM worker SMTP delivery)
 
 ## Prerequisites
 
@@ -164,9 +165,9 @@ If you do not see enough roles, ask the project owner/admin to grant them in:
 
 6. Create an OpenAI API key
 - Generate a key in your OpenAI account.
-- Put it in one place: `backend/config.py` -> `OPENAI_API_KEY = "sk-..."`.
-- You can still use shell env `OPENAI_API_KEY`; env values override the file when set.
-- Never put it in frontend code.
+- Recommended deploy path: store it in Secret Manager (for example `openai-api-key`) and set `OPENAI_SECRET_NAME`.
+- Local-only fallback: export `OPENAI_API_KEY` in your shell or ignored `infra/gcp/env.sh`.
+- Never put real keys in frontend code, `backend/config.py`, or committed deploy config.
 
 7. Optional: install `cloud-sql-proxy` (only needed for local backfill to Cloud SQL)
 - What this is: a local tunnel from your laptop to your Cloud SQL instance.
@@ -200,21 +201,47 @@ gcloud config set project YOUR_PROJECT_ID
 ```
 
 Then choose one config method:
-- Recommended: set values in `infra/gcp/deploy_config.py` (no long export block needed).
+- Recommended: copy `infra/gcp/env.example.sh` to ignored `infra/gcp/env.sh` and fill project-specific values/secrets there.
 - Alternative: export shell env vars in Git Bash/WSL.
+- Keep `infra/gcp/deploy_config.py` publish-safe; it should contain defaults only.
 
-## Configure Values In One Python File (Recommended)
+## Configure Values Safely
 
-All `infra/gcp/*.sh` scripts now auto-load values from:
-- `infra/gcp/deploy_config.py`
+All `infra/gcp/*.sh` scripts auto-load values from:
+- ignored `infra/gcp/env.sh`, when present
+- publish-safe defaults in `infra/gcp/deploy_config.py`
 
-Edit `infra/gcp/deploy_config.py` and set the required fields:
+Copy the template and edit the ignored local file:
+
+```bash
+cp infra/gcp/env.example.sh infra/gcp/env.sh
+# edit infra/gcp/env.sh with your real project values
+source infra/gcp/env.sh
+```
+
+Set the required fields:
 - `PROJECT_ID`
 - `REPO`
 - `DB_PASSWORD`
 - `BUCKET_NAME`
 - `GOOGLE_OAUTH_CLIENT_ID`
-- `OPENAI_API_KEY` (or keep this unset and rely on `backend/config.py` key)
+- `OPENAI_SECRET_NAME` (recommended) or local-only `OPENAI_API_KEY`
+
+Optional digest delivery fields:
+- `WEB_APP_BASE_URL`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASSWORD`
+- `SMTP_FROM`
+- `DIGEST_SWEEP_SECRET`
+- `DIGEST_SWEEP_INTERVAL_MINUTES`
+- `DIGEST_PROFILE_MAX_JOBS`
+- `DIGEST_MAX_ITEMS_PER_EMAIL`
+- `DIGEST_JOB_EXCERPT_CHARS`
+- `DIGEST_SEND_HOUR_LOCAL`
+- `DIGEST_WEEKLY_WEEKDAY`
+- `DIGEST_SWEEP_JOB_NAME`
 
 You can keep defaults for most other fields (`REGION`, image names, service names, etc.) unless you want custom names.
 
@@ -252,10 +279,10 @@ gcloud config set project YOUR_PROJECT_ID
 your-project-id-capstone-artifacts
 ```
 
-5. `OPENAI_API_KEY`
-- Option A: put it in `infra/gcp/deploy_config.py` as `OPENAI_API_KEY="sk-..."`.
-- Option B: leave it unset here and put it in `backend/config.py` (`OPENAI_API_KEY`).
-- Option C: export `OPENAI_API_KEY` in shell for a one-off override.
+5. `OPENAI_SECRET_NAME`
+- Recommended: create a Secret Manager secret such as `openai-api-key`, grant the API/worker service accounts access, and set `OPENAI_SECRET_NAME="openai-api-key"`.
+- Local-only fallback: export `OPENAI_API_KEY` in `infra/gcp/env.sh` or your shell.
+- Do not commit real OpenAI keys.
 
 6. `GOOGLE_OAUTH_CLIENT_ID`
 - Create a Google OAuth Web Client in Google Cloud Console.
@@ -264,18 +291,16 @@ your-project-id-capstone-artifacts
   - frontend gets `VITE_GOOGLE_CLIENT_ID`
   - backend verifies bearer ID tokens using `WEBAPP_GOOGLE_CLIENT_ID`
 
-### Minimal safe config to paste
+### Minimal safe local env file
 
-```python
-# infra/gcp/deploy_config.py
-CONFIG = DeployConfig(
-    PROJECT_ID="video-summarizer-487915",
-    REPO="capstone-repo",
-    DB_PASSWORD="1e344de5940d4378ac21fc80ae03dccb",
-    BUCKET_NAME="video-summarizer-487915-capstone-artifacts",
-    GOOGLE_OAUTH_CLIENT_ID="your-google-oauth-client-id.apps.googleusercontent.com",
-    OPENAI_API_KEY=None,  # uses backend/config.py fallback
-)
+```bash
+# infra/gcp/env.sh (ignored by git)
+export PROJECT_ID="your-project-id"
+export REPO="capstone-repo"
+export DB_PASSWORD="replace-me"
+export BUCKET_NAME="your-project-id-capstone-artifacts"
+export GOOGLE_OAUTH_CLIENT_ID="your-google-oauth-client-id.apps.googleusercontent.com"
+export OPENAI_SECRET_NAME="openai-api-key"
 ```
 
 ### Verify your Python config is being read
@@ -292,25 +317,13 @@ bash -lc 'cd /mnt/c/Users/danmc/Documents/capstone; source infra/gcp/load_python
 ```
 If it prints:
 ```text
-declare -x PROJECT_ID="tribal-primer-438802-n0"
+declare -x PROJECT_ID="your-project-id"
 ```
-that means your `infra/gcp/deploy_config.py` value is being loaded correctly.
+that means your local deploy environment is being loaded correctly.
 
 Important:
 - This does **not** change global gcloud config by itself.
 - `gcloud config get-value project` may still show another project until deploy preflight runs `gcloud config set project "${PROJECT_ID}"` (or you set it manually).
-
-Example:
-```python
-# infra/gcp/deploy_config.py
-CONFIG = DeployConfig(
-    PROJECT_ID="your-project-id",
-    REPO="capstone-repo",
-    DB_PASSWORD="replace-me",
-    BUCKET_NAME="your-project-id-capstone-artifacts",
-    OPENAI_API_KEY="sk-...",
-)
-```
 
 ## Worker Runtime (VM only)
 
@@ -318,6 +331,40 @@ Set `WORKER_RUNTIME` in `infra/gcp/deploy_config.py` to:
 - `compute_engine`
 
 Cloud Run worker mode is no longer supported in these deploy scripts.
+
+## Email Digest Feature
+
+The app can send per-user email digests to the signed-in Google account.
+
+Behavior:
+- opt-in from the web UI
+- cadence: `daily` or `weekly`
+- fixed send time: `8:00 AM` in the saved local timezone
+- first real digest can include historical completed jobs from before enable time
+- rolling profile already uses historical completed jobs
+- later digests are incremental after the first successful digest
+- empty windows are recorded but do not send email
+- digest emails include direct links back into the web app
+
+Infra/runtime flow:
+1. Cloud Scheduler sends `POST /internal/digests/sweep` to the API.
+2. API validates `X-Capstone-Digest-Secret` and enqueues one digest sweep job.
+3. The VM worker loads due user preferences, builds digest/profile text, and sends email over SMTP.
+
+What must be configured:
+- `SMTP_*` values for actual email delivery
+- `WEB_APP_BASE_URL` so email links point at the frontend
+- `DIGEST_SWEEP_SECRET` so the scheduler endpoint is not openly triggerable
+
+Deploy behavior:
+- `bootstrap.sh` now enables `cloudscheduler.googleapis.com`
+- `deploy_api.sh` passes digest env vars into Cloud Run and creates/updates the Cloud Scheduler job when `DIGEST_SWEEP_SECRET` is set
+- `deploy_worker_vm.sh` passes SMTP + digest config into the VM worker runtime
+
+If `DIGEST_SWEEP_SECRET` is unset:
+- the feature still deploys in a disabled/incomplete state
+- users can see digest settings UI
+- enabling delivery will fail until SMTP and the sweep secret are configured
 
 Example:
 ```python
@@ -338,10 +385,8 @@ When using `compute_engine`, configure VM defaults as needed:
 
 Notes:
 - Existing shell env vars still override Python file values.
-- `OPENAI_API_KEY` resolution order is:
-  1) shell env `OPENAI_API_KEY` (if already set)
-  2) `infra/gcp/deploy_config.py` (`OPENAI_API_KEY`)
-  3) `backend/config.py` (`OPENAI_API_KEY`)
+- `OPENAI_SECRET_NAME` is preferred for deployed services.
+- `OPENAI_API_KEY` is still supported for local-only shell overrides.
 
 ## Shell Environment Variable Alternative
 
@@ -361,7 +406,8 @@ export DB_PASSWORD="replace-me"
 
 export REDIS_INSTANCE="capstone-redis"
 export BUCKET_NAME="${PROJECT_ID}-capstone-artifacts"
-export OPENAI_API_KEY="sk-..."
+export OPENAI_SECRET_NAME="openai-api-key"
+# export OPENAI_API_KEY="replace-with-openai-key" # local-only fallback
 ```
 
 Optional environment variables (if you want to override Python file/defaults):
@@ -371,8 +417,8 @@ export NETWORK="default"
 export VPC_CONNECTOR="capstone-connector"
 export VPC_CONNECTOR_RANGE="10.8.0.0/28"
 export SQL_EDITION="ENTERPRISE"
-export SQL_TIER="db-f1-micro"     # cost-optimized target for low traffic
-# export SQL_STORAGE_TYPE="PD_HDD" # optional extra savings (if acceptable / supported)
+export SQL_TIER="db-f1-micro"   # cost-optimized target for low traffic
+# export SQL_STORAGE_TYPE="HDD" # optional extra savings (if acceptable / supported)
 
 export REDIS_RUNTIME="worker_vm"  # memorystore|worker_vm
 export REDIS_INSTANCE="capstone-redis"  # used when REDIS_RUNTIME=memorystore
@@ -392,8 +438,8 @@ export WORKER_SERVICE_ACCOUNT="audio-summarizer-worker-sa"
 export WORKER_VM_SERVICE_ACCOUNT="audio-summarizer-worker-vm-sa"
 export WORKER_VM_NAME="audio-summarizer-worker-vm"
 export WORKER_VM_ZONE="us-central1-a"
-export WORKER_VM_MACHINE_TYPE="e2-standard-2"
-export WORKER_VM_DISK_SIZE_GB="64"
+export WORKER_VM_MACHINE_TYPE="e2-small"
+export WORKER_VM_DISK_SIZE_GB="32"
 export WORKER_VM_IMAGE_FAMILY="debian-12"
 export WORKER_VM_IMAGE_PROJECT="debian-cloud"
 export WORKER_VM_NETWORK="default"
@@ -646,6 +692,9 @@ Recommended settings in `infra/gcp/deploy_config.py`:
 WORKER_RUNTIME="compute_engine"
 REDIS_RUNTIME="worker_vm"
 SQL_TIER="db-f1-micro"   # target; helper falls back to db-g1-small
+SQL_STORAGE_TYPE="HDD"  # optional extra savings if accepted
+WORKER_VM_MACHINE_TYPE="e2-small"
+WORKER_VM_DISK_SIZE_GB="32"
 # REDIS_VM_REQUIREPASS="..."  # prefer shell env override so secrets are not committed
 ```
 
@@ -654,6 +703,7 @@ What changes in this mode:
 - Worker still runs on the persistent VM (same YouTube Chrome/cookies workflow).
 - Redis queue runs on the worker VM instead of Memorystore.
 - Cloud SQL is right-sized to a shared-core tier for low traffic.
+- The low-risk VM target is `e2-small` with a `32 GB` boot disk.
 
 ### Cutover sequence (recommended)
 
@@ -706,6 +756,9 @@ bash infra/gcp/deploy_worker_vm.sh
 - VM Redis is cheaper but less managed than Memorystore.
 - Shared-core Cloud SQL is slower than custom tiers, but often good enough for small personal workloads.
 - `pause_stack.sh` / `resume_stack.sh` still exist as optional extra savings; they are not the main online cost-reduction strategy.
+- If your 72-hour average still stays above about `$0.90/day` after this pass, the likely remaining always-on floor is the Serverless VPC connector. That next savings step requires an architecture change, not just another config tweak.
+- Note: GCE boot disks cannot be shrunk in place. Setting `WORKER_VM_DISK_SIZE_GB="32"` changes the target for future VM creation, but an existing `64 GB` worker disk must be recreated to realize that specific savings live.
+- Note: Cloud SQL storage type is often immutable after creation. If your existing instance rejects an `SQL_STORAGE_TYPE="HDD"` patch, keep the shared-core tier and treat disk-type savings as a recreate-time option rather than an in-place optimization.
 
 ## Typical sequence
 
@@ -840,5 +893,6 @@ gcloud beta run domain-mappings describe --domain "${API_DOMAIN}" --region "${RE
 ## Security notes
 
 - Keep `OPENAI_API_KEY` server-side only.
-- For stronger key hygiene, migrate scripts to use Secret Manager references instead of plain env var injection.
+- Prefer `OPENAI_SECRET_NAME` + Secret Manager for deployed services.
+- Keep real DB passwords, SMTP credentials, digest secrets, OAuth client IDs, and proxy credentials in ignored `infra/gcp/env.sh` or your shell, not committed config.
 - Worker is deployed with internal ingress and no unauthenticated access by default.

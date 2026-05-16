@@ -17,6 +17,7 @@ class JobRecord(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     owner_email: Mapped[str] = mapped_column(String(320), index=True, nullable=False)
 
     status: Mapped[str] = mapped_column(String(32), default="queued")
@@ -51,6 +52,48 @@ class JobRecord(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
+
+
+class DigestPreference(Base):
+    __tablename__ = "digest_preferences"
+
+    owner_email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    cadence: Mapped[str] = mapped_column(String(16), default="daily", nullable=False)
+    timezone_name: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
+    send_hour_local: Mapped[int] = mapped_column(Integer, default=8, nullable=False)
+    weekly_weekday: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    last_digest_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    include_historical_on_next_send: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_send_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    profile_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    profile_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, index=True)
+
+
+class DigestRun(Base):
+    __tablename__ = "digest_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_email: Mapped[str] = mapped_column(String(320), index=True, nullable=False)
+    cadence: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    window_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    window_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    job_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    included_job_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    subject: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    profile_summary_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ChatMessage(Base):

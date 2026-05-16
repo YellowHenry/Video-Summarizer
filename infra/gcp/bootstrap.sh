@@ -37,7 +37,8 @@ gcloud services enable \
   sqladmin.googleapis.com \
   redis.googleapis.com \
   cloudbuild.googleapis.com \
-  secretmanager.googleapis.com
+  secretmanager.googleapis.com \
+  cloudscheduler.googleapis.com
 
 gcloud artifacts repositories create "${REPO}" \
   --repository-format=docker \

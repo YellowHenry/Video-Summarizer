@@ -15,7 +15,7 @@ from backend.webapp import api as web_api
 from backend.webapp import config as web_config
 from backend.webapp import tasks as web_tasks
 from backend.webapp.db import Base
-from backend.webapp.models import JobArtifact, JobRecord
+from backend.webapp.models import DigestPreference, JobArtifact, JobRecord
 from backend.webapp.services import get_services
 
 
@@ -368,3 +368,28 @@ def test_search_returns_chunk_links(web_env, monkeypatch: pytest.MonkeyPatch):
     assert payload["answer"] == "Search answer"
     assert len(payload["hits"]) == 1
     assert payload["hits"][0]["file_link"] is not None
+
+
+def test_digest_settings_enable_marks_historical_backfill_pending(web_env, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(web_api, "_digest_delivery_status", lambda: (True, None))
+    client = TestClient(web_api.app)
+
+    initial = client.get("/api/digests/settings")
+    assert initial.status_code == 200
+    assert initial.json()["historical_backfill_pending"] is False
+
+    response = client.put(
+        "/api/digests/settings",
+        json={"enabled": True, "cadence": "daily", "timezone": "America/New_York"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["enabled"] is True
+    assert payload["historical_backfill_pending"] is True
+
+    SessionLocal = web_env["session"]
+    with SessionLocal() as session:
+        row = session.get(DigestPreference, "dev@example.com")
+        assert row is not None
+        assert row.last_digest_cutoff_at is None
+        assert row.include_historical_on_next_send is True

@@ -12,9 +12,13 @@ from .auth import owner_key_from_email
 from .config import settings
 
 try:
+    import google.auth
     from google.cloud import storage as gcs_storage
+    from google.auth.transport.requests import Request as GoogleAuthRequest
 except ImportError:  # pragma: no cover - optional dependency
+    google.auth = None
     gcs_storage = None
+    GoogleAuthRequest = None
 
 
 INVALID_KEY_PATTERN = re.compile(r"(^/)|(\.\.)|(^[A-Za-z]:)")
@@ -100,7 +104,22 @@ class GCSObjectStore(BaseObjectStore):
     def __init__(self, bucket_name: str):
         if not gcs_storage:
             raise RuntimeError("google-cloud-storage is required for OBJECT_STORAGE_BACKEND=gcs")
-        self.client = gcs_storage.Client()
+        project = (
+            os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+            or os.getenv("GCLOUD_PROJECT", "").strip()
+            or None
+        )
+        credentials = None
+        if google.auth:
+            credentials, detected_project = google.auth.default()
+            if not project:
+                project = detected_project
+            # Pre-refresh once using the plain Google auth request transport.
+            # On the worker VM, this avoids flaky lazy refresh behavior later in
+            # google-cloud-storage's authorized session path.
+            if credentials and not credentials.valid and GoogleAuthRequest:
+                credentials.refresh(GoogleAuthRequest())
+        self.client = gcs_storage.Client(project=project, credentials=credentials)
         self.bucket = self.client.bucket(bucket_name)
 
     def _blob(self, object_key: str):

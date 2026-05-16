@@ -81,6 +81,42 @@ type AuthMeResponse = {
   picture?: string | null;
 };
 
+type DigestSettingsResponse = {
+  enabled: boolean;
+  cadence: "daily" | "weekly";
+  timezone: string;
+  send_hour_local: number;
+  weekly_weekday: number;
+  recipient_email: string;
+  delivery_available: boolean;
+  delivery_reason?: string | null;
+  next_send_at?: string | null;
+  last_run_at?: string | null;
+  last_run_status?: string | null;
+  last_sent_at?: string | null;
+  profile_summary?: string | null;
+  profile_updated_at?: string | null;
+  historical_backfill_pending: boolean;
+};
+
+type UpdateDigestSettingsRequest = {
+  enabled: boolean;
+  cadence: "daily" | "weekly";
+  timezone: string;
+};
+
+type DigestRunOut = {
+  id: number;
+  status: string;
+  cadence: string;
+  job_count: number;
+  subject?: string | null;
+  window_start_at?: string | null;
+  window_end_at?: string | null;
+  created_at: string;
+  sent_at?: string | null;
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const AUTH_TOKEN_STORAGE_KEY = "audio_summarizer_auth_token";
@@ -96,6 +132,21 @@ class ApiError extends Error {
     this.status = status;
     this.body = body;
   }
+}
+
+function apiErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    try {
+      const parsed = JSON.parse(error.body);
+      if (parsed && typeof parsed.detail === "string") {
+        return parsed.detail;
+      }
+    } catch {
+      return error.body;
+    }
+    return error.body;
+  }
+  return String(error);
 }
 
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -215,7 +266,104 @@ function looksLikeUrl(value: string | null | undefined): boolean {
   return trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("www.");
 }
 
+function parseInitialJobQuery(): { jobId: string; tab: "summary" | "transcript" | "chat" } {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const rawTab = params.get("tab");
+    const tab =
+      rawTab === "transcript" || rawTab === "chat" || rawTab === "summary" ? rawTab : "summary";
+    return { jobId: params.get("job") || "", tab };
+  } catch {
+    return { jobId: "", tab: "summary" };
+  }
+}
+
+const JOB_PROGRESS_STAGES = [
+  { key: "queued", label: "Queued", helper: "Waiting for a worker." },
+  { key: "downloading", label: "Downloading", helper: "Fetching media or captions." },
+  { key: "preprocessing", label: "Prepping", helper: "Normalizing audio and inputs." },
+  { key: "summarizing", label: "Summarizing", helper: "Building transcript and summary." },
+  { key: "complete", label: "Ready", helper: "Summary, transcript, and chat are ready." },
+  { key: "failed", label: "Needs attention", helper: "The job stopped before completion." }
+] as const;
+
+type JobProgressStage = (typeof JOB_PROGRESS_STAGES)[number]["key"];
+
+function normalizeJobStatus(status: string | null | undefined): JobProgressStage {
+  const normalized = (status || "").trim().toLowerCase();
+  if (normalized === "failed" || normalized === "error") {
+    return "failed";
+  }
+  if (normalized === "complete" || normalized === "completed" || normalized === "done") {
+    return "complete";
+  }
+  if (normalized === "summarizing" || normalized === "transcribing") {
+    return "summarizing";
+  }
+  if (normalized === "preprocessing" || normalized === "processing") {
+    return "preprocessing";
+  }
+  if (normalized === "downloading") {
+    return "downloading";
+  }
+  return "queued";
+}
+
+function transcriptRouteLabel(job: JobDetail | null): string {
+  if (!job) {
+    return "Transcript route pending";
+  }
+  if (job.transcript_source === "youtube_subtitles") {
+    return "Manual YouTube captions";
+  }
+  if (job.transcript_source === "youtube_auto_captions") {
+    return "YouTube auto captions";
+  }
+  if (job.transcript_source === "whisper") {
+    return "Whisper fallback";
+  }
+  if (job.prefer_youtube_captions) {
+    return job.allow_whisper_fallback ? "Captions first, Whisper fallback allowed" : "Captions only";
+  }
+  return "Whisper transcription";
+}
+
+function friendlyFailureMessage(error: string | null | undefined): string {
+  const detail = (error || "").toLowerCase();
+  if (detail.includes("yt-dlp") || detail.includes("youtube") || detail.includes("requested format")) {
+    return "YouTube did not provide a usable transcript or downloadable audio format for this run. This can happen when YouTube changes its player challenge, rate-limits the worker, or only exposes image/storyboard formats.";
+  }
+  if (detail.includes("openai") || detail.includes("api key") || detail.includes("model")) {
+    return "The AI step could not complete. The source was accepted, but the summarization provider returned an error.";
+  }
+  if (detail.includes("timeout")) {
+    return "The job took too long and timed out before the summary was ready.";
+  }
+  return "This job stopped before a summary could be generated. The technical detail is preserved below for debugging.";
+}
+
+function summaryEmptyCopy(status: string | null | undefined): { title: string; body: string } {
+  const stage = normalizeJobStatus(status);
+  if (stage === "failed") {
+    return {
+      title: "No summary was generated",
+      body: "The job failed before the AI summary was ready. Try again, or open Debug info for the exact technical failure."
+    };
+  }
+  if (stage === "complete") {
+    return {
+      title: "Summary artifact is missing",
+      body: "The job is marked complete, but the summary file was not available. Refresh or check Debug info."
+    };
+  }
+  return {
+    title: "Summary is not ready yet",
+    body: "The worker is still processing this job. The page refreshes automatically while it moves through the timeline."
+  };
+}
+
 export default function App() {
+  const initialJobQuery = useMemo(() => parseInitialJobQuery(), []);
   const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "");
   const [authProfile, setAuthProfile] = useState<AuthMeResponse | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -234,6 +382,8 @@ export default function App() {
   const [selectedJob, setSelectedJob] = useState<JobDetail | null>(null);
   const [summaryArtifact, setSummaryArtifact] = useState<ArtifactResponse | null>(null);
   const [transcriptArtifact, setTranscriptArtifact] = useState<ArtifactResponse | null>(null);
+  const [jobDataLoading, setJobDataLoading] = useState(false);
+  const [artifactsLoading, setArtifactsLoading] = useState(false);
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
@@ -243,10 +393,28 @@ export default function App() {
   const [searchCreatedAfter, setSearchCreatedAfter] = useState("");
   const [searchCreatedBefore, setSearchCreatedBefore] = useState("");
   const [searchResult, setSearchResult] = useState<SearchResponse | null>(null);
+  const [searchBusy, setSearchBusy] = useState(false);
   const [busySubmit, setBusySubmit] = useState(false);
+  const [retryBusy, setRetryBusy] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [jobDetailTab, setJobDetailTab] = useState<"summary" | "transcript" | "chat">("summary");
   const [isJobListVisible, setIsJobListVisible] = useState(true);
+  const detectedTimeZone = useMemo(
+    () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    []
+  );
+  const pendingUrlJobIdRef = useRef<string>(initialJobQuery.jobId);
+  const pendingUrlTabRef = useRef<"summary" | "transcript" | "chat" | null>(
+    initialJobQuery.jobId ? initialJobQuery.tab : null
+  );
+  const [digestSettings, setDigestSettings] = useState<DigestSettingsResponse | null>(null);
+  const [digestHistory, setDigestHistory] = useState<DigestRunOut[]>([]);
+  const [digestEnabled, setDigestEnabled] = useState(false);
+  const [digestCadence, setDigestCadence] = useState<"daily" | "weekly">("daily");
+  const [digestTimezone, setDigestTimezone] = useState(detectedTimeZone);
+  const [digestBusy, setDigestBusy] = useState(false);
+  const [digestError, setDigestError] = useState("");
+  const [digestSaveNotice, setDigestSaveNotice] = useState("");
 
   const clearSession = () => {
     localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
@@ -257,7 +425,13 @@ export default function App() {
     setSelectedJob(null);
     setSummaryArtifact(null);
     setTranscriptArtifact(null);
+    setJobDataLoading(false);
+    setArtifactsLoading(false);
     setChat([]);
+    setDigestSettings(null);
+    setDigestHistory([]);
+    setDigestError("");
+    setDigestSaveNotice("");
   };
 
   const handleApiError = (error: unknown) => {
@@ -270,7 +444,7 @@ export default function App() {
       setErrorText("Network error while contacting the API. Please retry.");
       return;
     }
-    setErrorText(String(error));
+    setErrorText(apiErrorMessage(error));
   };
 
   const selectedJobRow = useMemo(() => jobs.find((job) => job.id === selectedJobId), [jobs, selectedJobId]);
@@ -294,6 +468,12 @@ export default function App() {
     const jobForTitle = selectedJob || selectedJobRow;
     return jobForTitle ? displayJobTitle(jobForTitle) : "(no selected job)";
   }, [selectedJob, selectedJobRow]);
+  const selectedStatus = selectedJob?.status || selectedJobRow?.status || "";
+  const selectedStage = normalizeJobStatus(selectedStatus);
+  const selectedStageIndex = JOB_PROGRESS_STAGES.findIndex((stage) => stage.key === selectedStage);
+  const selectedUpdatedAt = selectedJob?.updated_at || selectedJobRow?.updated_at || "";
+  const selectedSourceUrl = selectedJob?.source_url || selectedJobRow?.source_url || "";
+  const canRetrySelectedJob = selectedStage === "failed" && Boolean(selectedSourceUrl);
 
   useEffect(() => {
     if (window.google?.accounts?.id) {
@@ -402,6 +582,11 @@ export default function App() {
         if (currentSelected && items.some((job) => job.id === currentSelected)) {
           return currentSelected;
         }
+        if (pendingUrlJobIdRef.current && items.some((job) => job.id === pendingUrlJobIdRef.current)) {
+          return pendingUrlJobIdRef.current;
+        }
+        pendingUrlJobIdRef.current = "";
+        pendingUrlTabRef.current = null;
         return items[0].id;
       });
     } finally {
@@ -409,32 +594,60 @@ export default function App() {
     }
   };
 
-  const loadJobData = async (jobId: string) => {
+  const loadDigestData = async () => {
     if (!authToken) {
       return;
     }
-    const [detail, chatResponse] = await Promise.all([
-      api<JobDetail>(`/api/jobs/${jobId}`, authToken),
-      api<ChatResponse>(`/api/jobs/${jobId}/chat`, authToken).catch(() => ({
-        job_id: jobId,
-        messages: [] as ChatMessage[]
-      }))
+    const [settingsResponse, historyResponse] = await Promise.all([
+      api<DigestSettingsResponse>("/api/digests/settings", authToken),
+      api<DigestRunOut[]>("/api/digests/history", authToken)
     ]);
-    setSelectedJob(detail);
-    setChat(chatResponse.messages);
-    setChatContextStats([]);
+    setDigestSettings(settingsResponse);
+    setDigestHistory(historyResponse);
+    setDigestEnabled(settingsResponse.enabled);
+    setDigestCadence(settingsResponse.cadence);
+    setDigestTimezone(settingsResponse.enabled ? settingsResponse.timezone || detectedTimeZone : detectedTimeZone);
+  };
 
-    try {
-      const artifact = await api<ArtifactResponse>(`/api/jobs/${jobId}/summary`, authToken);
-      setSummaryArtifact(artifact);
-    } catch {
-      setSummaryArtifact(null);
+  const loadJobData = async (jobId: string, options: { showLoading?: boolean } = {}) => {
+    if (!authToken) {
+      return;
+    }
+    if (options.showLoading) {
+      setJobDataLoading(true);
+      setArtifactsLoading(true);
     }
     try {
-      const artifact = await api<ArtifactResponse>(`/api/jobs/${jobId}/transcript`, authToken);
-      setTranscriptArtifact(artifact);
-    } catch {
-      setTranscriptArtifact(null);
+      const [detail, chatResponse] = await Promise.all([
+        api<JobDetail>(`/api/jobs/${jobId}`, authToken),
+        api<ChatResponse>(`/api/jobs/${jobId}/chat`, authToken).catch(() => ({
+          job_id: jobId,
+          messages: [] as ChatMessage[]
+        }))
+      ]);
+      setSelectedJob(detail);
+      setChat(chatResponse.messages);
+      setChatContextStats([]);
+    } finally {
+      if (options.showLoading) {
+        setJobDataLoading(false);
+      }
+    }
+
+    if (options.showLoading) {
+      setArtifactsLoading(true);
+    }
+    try {
+      const [summary, transcript] = await Promise.all([
+        api<ArtifactResponse>(`/api/jobs/${jobId}/summary`, authToken).catch(() => null),
+        api<ArtifactResponse>(`/api/jobs/${jobId}/transcript`, authToken).catch(() => null)
+      ]);
+      setSummaryArtifact(summary);
+      setTranscriptArtifact(transcript);
+    } finally {
+      if (options.showLoading) {
+        setArtifactsLoading(false);
+      }
     }
   };
 
@@ -443,6 +656,7 @@ export default function App() {
       return () => undefined;
     }
     loadJobs().catch(handleApiError);
+    loadDigestData().catch(handleApiError);
     const timer = window.setInterval(() => {
       loadJobs().catch(handleApiError);
     }, 5000);
@@ -457,12 +671,22 @@ export default function App() {
       setSelectedJob(null);
       setSummaryArtifact(null);
       setTranscriptArtifact(null);
+      setJobDataLoading(false);
+      setArtifactsLoading(false);
       setChat([]);
       setJobDetailTab("summary");
       return;
     }
-    setJobDetailTab("summary");
-    loadJobData(selectedJobId).catch(handleApiError);
+    if (pendingUrlTabRef.current && selectedJobId === pendingUrlJobIdRef.current) {
+      setJobDetailTab(pendingUrlTabRef.current);
+      pendingUrlJobIdRef.current = "";
+      pendingUrlTabRef.current = null;
+    } else {
+      setJobDetailTab("summary");
+    }
+    setSummaryArtifact(null);
+    setTranscriptArtifact(null);
+    loadJobData(selectedJobId, { showLoading: true }).catch(handleApiError);
   }, [authProfile, authToken, selectedJobId]);
 
   useEffect(() => {
@@ -474,6 +698,23 @@ export default function App() {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [authProfile, authToken, selectedJobId]);
+
+  useEffect(() => {
+    if (!authReady) {
+      return;
+    }
+    const params = new URLSearchParams(window.location.search);
+    if (selectedJobId) {
+      params.set("job", selectedJobId);
+      params.set("tab", jobDetailTab);
+    } else {
+      params.delete("job");
+      params.delete("tab");
+    }
+    const nextQuery = params.toString();
+    const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ""}`;
+    window.history.replaceState({}, "", nextUrl);
+  }, [authReady, selectedJobId, jobDetailTab]);
 
   const submitJob = async (event: FormEvent) => {
     event.preventDefault();
@@ -537,6 +778,34 @@ export default function App() {
     }
   };
 
+  const retrySelectedJob = async () => {
+    if (!authToken || !selectedSourceUrl) {
+      return;
+    }
+    setErrorText("");
+    setRetryBusy(true);
+    try {
+      const created = await api<CreateJobResponse>("/api/jobs", authToken, {
+        method: "POST",
+        body: JSON.stringify({
+          youtube_url: selectedSourceUrl,
+          prefer_youtube_captions: selectedJob?.prefer_youtube_captions ?? preferCaptions,
+          allow_whisper_fallback:
+            selectedJob?.prefer_youtube_captions === false
+              ? true
+              : selectedJob?.allow_whisper_fallback ?? allowWhisperFallback
+        })
+      });
+      await loadJobs();
+      setSelectedJobId(created.job_id);
+      setJobDetailTab("summary");
+    } catch (error) {
+      handleApiError(error);
+    } finally {
+      setRetryBusy(false);
+    }
+  };
+
   const sendJobChat = async (event: FormEvent) => {
     event.preventDefault();
     if (!authToken || !selectedJobId || !chatInput.trim()) {
@@ -569,12 +838,45 @@ export default function App() {
     }
   };
 
+  const saveDigestSettings = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!authToken) {
+      setAuthError("Sign in is required before updating digest settings.");
+      return;
+    }
+    setDigestBusy(true);
+    setDigestError("");
+    setDigestSaveNotice("");
+    try {
+      const payload: UpdateDigestSettingsRequest = {
+        enabled: digestEnabled,
+        cadence: digestCadence,
+        timezone: digestTimezone || detectedTimeZone || "UTC"
+      };
+      const updated = await api<DigestSettingsResponse>("/api/digests/settings", authToken, {
+        method: "PUT",
+        body: JSON.stringify(payload)
+      });
+      setDigestSettings(updated);
+      setDigestEnabled(updated.enabled);
+      setDigestCadence(updated.cadence);
+      setDigestTimezone(updated.timezone || detectedTimeZone);
+      setDigestHistory(await api<DigestRunOut[]>("/api/digests/history", authToken));
+      setDigestSaveNotice("Digest settings saved.");
+    } catch (error) {
+      setDigestError(apiErrorMessage(error));
+    } finally {
+      setDigestBusy(false);
+    }
+  };
+
   const runSearch = async (event: FormEvent) => {
     event.preventDefault();
     if (!authToken || !searchQ.trim()) {
       return;
     }
     setErrorText("");
+    setSearchBusy(true);
     try {
       const payload = {
         question: searchQ.trim(),
@@ -590,6 +892,8 @@ export default function App() {
       setActiveTab("search");
     } catch (error) {
       handleApiError(error);
+    } finally {
+      setSearchBusy(false);
     }
   };
 
@@ -705,62 +1009,191 @@ export default function App() {
 
         {activeTab === "jobs" && (
           <section className={isJobListVisible ? "content-grid" : "content-grid jobs-list-hidden"}>
-            <section className="card submit-card">
-              <div className="row-between">
-                <h2>Submit Job</h2>
-                <button
-                  type="button"
-                  className="list-toggle-btn"
-                  onClick={() => setIsJobListVisible((visible) => !visible)}
-                >
-                  {isJobListVisible ? "Hide Jobs" : "Show Jobs"}
-                </button>
-              </div>
-              <p className="submit-meta">{totalJobsLabel} total jobs</p>
-              <form className="submit-grid" onSubmit={submitJob}>
-                <div>
-                  <label htmlFor="youtube-url-input">YouTube URL</label>
-                  <input
-                    id="youtube-url-input"
-                    value={youtubeUrl}
-                    onChange={(event) => setYoutubeUrl(event.target.value)}
-                    placeholder="https://www.youtube.com/watch?v=..."
-                  />
+            <div className="left-rail">
+              <section className="card submit-card">
+                <div className="row-between">
+                  <h2>Submit Job</h2>
+                  <button
+                    type="button"
+                    className="list-toggle-btn"
+                    onClick={() => setIsJobListVisible((visible) => !visible)}
+                  >
+                    {isJobListVisible ? "Hide Jobs" : "Show Jobs"}
+                  </button>
                 </div>
-                <div>
-                  <label htmlFor="upload-file-input">Upload file</label>
-                  <input
-                    id="upload-file-input"
-                    type="file"
-                    onChange={(event) => setFile(event.target.files?.[0] || null)}
-                  />
+                <p className="submit-meta">{totalJobsLabel} total jobs</p>
+                <form className="submit-grid" onSubmit={submitJob}>
+                  <div>
+                    <label htmlFor="youtube-url-input">YouTube URL</label>
+                    <input
+                      id="youtube-url-input"
+                      value={youtubeUrl}
+                      onChange={(event) => setYoutubeUrl(event.target.value)}
+                      placeholder="https://www.youtube.com/watch?v=..."
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="upload-file-input">Upload file</label>
+                    <input
+                      id="upload-file-input"
+                      type="file"
+                      onChange={(event) => setFile(event.target.files?.[0] || null)}
+                    />
+                  </div>
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={preferCaptions}
+                      onChange={(event) => setPreferCaptions(event.target.checked)}
+                    />
+                    Prefer YouTube captions first
+                  </label>
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={allowWhisperFallback}
+                      disabled={!preferCaptions}
+                      onChange={(event) => setAllowWhisperFallback(event.target.checked)}
+                    />
+                    Allow Whisper fallback when captions are unavailable
+                  </label>
+                  <button type="submit" disabled={busySubmit}>
+                    {busySubmit ? "Submitting..." : "Submit"}
+                  </button>
+                </form>
+                {busySubmit && (
+                  <div className="loading-state compact">
+                    Creating a private job and sending it to the worker queue...
+                  </div>
+                )}
+                <div className="submit-footer">
+                  <span>Completed jobs</span>
+                  <strong>{completedJobsLabel}</strong>
                 </div>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={preferCaptions}
-                    onChange={(event) => setPreferCaptions(event.target.checked)}
-                  />
-                  Prefer YouTube captions first
-                </label>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={allowWhisperFallback}
-                    disabled={!preferCaptions}
-                    onChange={(event) => setAllowWhisperFallback(event.target.checked)}
-                  />
-                  Allow Whisper fallback when captions are unavailable
-                </label>
-                <button type="submit" disabled={busySubmit}>
-                  {busySubmit ? "Submitting..." : "Submit"}
-                </button>
-              </form>
-              <div className="submit-footer">
-                <span>Completed jobs</span>
-                <strong>{completedJobsLabel}</strong>
-              </div>
-            </section>
+              </section>
+
+              <section className="card digest-card">
+                <div className="row-between">
+                  <h2>Email Digests</h2>
+                  <span className="muted small">
+                    {digestSettings?.enabled ? digestSettings.cadence : "off"}
+                  </span>
+                </div>
+                <p className="muted small">
+                  Send a daily or weekly recap of your completed summaries to your signed-in email.
+                </p>
+                {digestError && <div className="error">Digest settings: {digestError}</div>}
+                {digestSaveNotice && <div className="notice">{digestSaveNotice}</div>}
+                <form className="digest-grid" onSubmit={saveDigestSettings}>
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={digestEnabled}
+                      onChange={(event) => setDigestEnabled(event.target.checked)}
+                    />
+                    Receive email digests
+                  </label>
+
+                  <div>
+                    <label>Cadence</label>
+                    <div className="segmented-choice">
+                      <label className="segmented-option">
+                        <input
+                          type="radio"
+                          name="digest-cadence"
+                          checked={digestCadence === "daily"}
+                          onChange={() => setDigestCadence("daily")}
+                        />
+                        <span>Daily</span>
+                      </label>
+                      <label className="segmented-option">
+                        <input
+                          type="radio"
+                          name="digest-cadence"
+                          checked={digestCadence === "weekly"}
+                          onChange={() => setDigestCadence("weekly")}
+                        />
+                        <span>Weekly</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="digest-readonly">
+                    <div>
+                      <span className="muted small">Recipient</span>
+                      <strong>{digestSettings?.recipient_email || authProfile?.email || "-"}</strong>
+                    </div>
+                    <div>
+                      <span className="muted small">Timezone</span>
+                      <strong>{digestTimezone || detectedTimeZone}</strong>
+                    </div>
+                    <div>
+                      <span className="muted small">Next send</span>
+                      <strong>{fmtDate(digestSettings?.next_send_at)}</strong>
+                    </div>
+                    <div>
+                      <span className="muted small">Last sent</span>
+                      <strong>{fmtDate(digestSettings?.last_sent_at)}</strong>
+                    </div>
+                    <div>
+                      <span className="muted small">Last status</span>
+                      <strong>{digestSettings?.last_run_status || "-"}</strong>
+                    </div>
+                    <div>
+                      <span className="muted small">Schedule</span>
+                      <strong>
+                        {digestCadence} at {digestSettings?.send_hour_local ?? 8}:00 local
+                      </strong>
+                    </div>
+                  </div>
+
+                  {!digestSettings?.delivery_available && (
+                    <div className="digest-warning">
+                      {digestSettings?.delivery_reason || "Digest delivery is unavailable right now."}
+                    </div>
+                  )}
+
+                  {digestSettings?.historical_backfill_pending && (
+                    <div className="digest-info-note">
+                      Your next digest will include older completed jobs from before you enabled digests.
+                    </div>
+                  )}
+
+                  <div className="digest-profile-preview">
+                    <div className="meta-section-kicker">Your profile lately</div>
+                    <p className="muted small">
+                      {digestSettings?.profile_summary ||
+                        "We'll build your taste profile from your completed jobs, including older ones, when your first digest is prepared."}
+                    </p>
+                  </div>
+
+                  <div className="digest-history">
+                    <div className="meta-section-kicker">Recent digests</div>
+                    {digestHistory.length > 0 ? (
+                      digestHistory.slice(0, 5).map((item) => (
+                        <div className="digest-history-row" key={item.id}>
+                          <div>
+                            <div className="digest-history-subject">
+                              {item.subject || `${item.cadence} digest`}
+                            </div>
+                            <div className="muted small">
+                              {fmtDate(item.sent_at || item.created_at)} · {item.job_count} jobs
+                            </div>
+                          </div>
+                          <span className={`digest-run-status status-${item.status}`}>{item.status}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted small">No digest history yet.</div>
+                    )}
+                  </div>
+
+                  <button type="submit" disabled={digestBusy}>
+                    {digestBusy ? "Saving..." : "Save digest settings"}
+                  </button>
+                </form>
+              </section>
+            </div>
 
             {isJobListVisible && (
               <article className="card jobs-list-card">
@@ -809,7 +1242,58 @@ export default function App() {
               ) : (
                 <div className="job-detail-body">
                   <div className="detail-title">{selectedDisplayTitle}</div>
-                  {selectedJob?.error && <div className="error">Job error: {selectedJob.error}</div>}
+                  <section className={`job-progress-card stage-${selectedStage}`} aria-label="Job progress">
+                    <div className="progress-card-header">
+                      <div>
+                        <div className="meta-section-kicker">Processing timeline</div>
+                        <strong>{JOB_PROGRESS_STAGES[selectedStageIndex]?.label || "Queued"}</strong>
+                      </div>
+                      <div className="progress-status-copy">
+                        <span>{jobDataLoading ? "Refreshing job detail..." : `Updated ${fmtDate(selectedUpdatedAt)}`}</span>
+                        <span>{transcriptRouteLabel(selectedJob)}</span>
+                      </div>
+                    </div>
+                    <ol className="progress-timeline">
+                      {JOB_PROGRESS_STAGES.map((stage, index) => {
+                        const isFailedStage = selectedStage === "failed";
+                        const isCurrent = stage.key === selectedStage;
+                        const isPast = !isFailedStage && index < selectedStageIndex;
+                        const isSkippedByFailure = isFailedStage && stage.key !== "failed";
+                        return (
+                          <li
+                            key={stage.key}
+                            className={[
+                              "progress-step",
+                              isCurrent ? "current" : "",
+                              isPast ? "past" : "",
+                              isSkippedByFailure ? "muted-step" : ""
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
+                          >
+                            <span className="progress-dot" aria-hidden />
+                            <span className="progress-label">{stage.label}</span>
+                            <span className="progress-helper">{stage.helper}</span>
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  </section>
+
+                  {selectedStage === "failed" && (
+                    <section className="failure-card" aria-label="Job failure">
+                      <div>
+                        <strong>We could not finish this job.</strong>
+                        <p>{friendlyFailureMessage(selectedJob?.error)}</p>
+                        <p className="muted small">Technical detail is kept in Debug info so the main view stays readable.</p>
+                      </div>
+                      {canRetrySelectedJob && (
+                        <button type="button" className="retry-btn" disabled={retryBusy} onClick={retrySelectedJob}>
+                          {retryBusy ? "Retrying..." : "Try again"}
+                        </button>
+                      )}
+                    </section>
+                  )}
 
                   <div className="job-detail-tabbar" role="tablist" aria-label="Job detail sections">
                     <button
@@ -843,6 +1327,7 @@ export default function App() {
 
                   {jobDetailTab === "summary" && (
                     <section className="job-detail-tab-panel" aria-label="Summary">
+                      {artifactsLoading && <div className="loading-state">Loading summary and transcript artifacts...</div>}
                       {summaryArtifact?.file_link && (
                         <p>
                           <a
@@ -861,13 +1346,17 @@ export default function App() {
                           className="markdown-panel summary-panel primary-content-panel"
                         />
                       ) : (
-                        <pre className="summary-panel primary-content-panel">(no summary yet)</pre>
+                        <div className="summary-panel primary-content-panel empty-artifact">
+                          <strong>{summaryEmptyCopy(selectedStatus).title}</strong>
+                          <p>{summaryEmptyCopy(selectedStatus).body}</p>
+                        </div>
                       )}
                     </section>
                   )}
 
                   {jobDetailTab === "transcript" && (
                     <section className="job-detail-tab-panel" aria-label="Transcript">
+                      {artifactsLoading && <div className="loading-state">Loading transcript artifact...</div>}
                       {transcriptArtifact?.file_link && (
                         <p>
                           <a
@@ -880,13 +1369,19 @@ export default function App() {
                           </a>
                         </p>
                       )}
-                      <pre className="transcript-panel">{transcriptArtifact?.text || "(no transcript yet)"}</pre>
+                      <pre className="transcript-panel">
+                        {transcriptArtifact?.text ||
+                          (selectedStage === "failed"
+                            ? "(no transcript was generated before this job failed)"
+                            : "(transcript is not ready yet)")}
+                      </pre>
                     </section>
                   )}
 
                   {jobDetailTab === "chat" && (
                     <section className="job-detail-tab-panel" aria-label="Job Chat">
                       <div className="chat-box primary-content-panel">
+                        {jobDataLoading && <div className="loading-state">Refreshing chat history...</div>}
                         {chat.map((msg) => (
                           <div key={msg.id} className={`chat-msg ${msg.role}`}>
                             <div className="chat-role">
@@ -899,7 +1394,13 @@ export default function App() {
                             )}
                           </div>
                         ))}
-                        {chat.length === 0 && <div className="muted">(no chat messages yet)</div>}
+                        {chat.length === 0 && (
+                          <div className="muted">
+                            {selectedStage === "complete"
+                              ? "(no chat messages yet)"
+                              : "(chat works best after the transcript is ready)"}
+                          </div>
+                        )}
                       </div>
                       <form className="chat-row" onSubmit={sendJobChat}>
                         <input
@@ -955,7 +1456,7 @@ export default function App() {
                         </div>
                         <div>
                           <div className="muted">Transcript Source</div>
-                          <div>{selectedJob?.transcript_source || "-"}</div>
+                          <div>{transcriptRouteLabel(selectedJob)}</div>
                         </div>
                         <div>
                           <div className="muted">Whisper Fallback</div>
@@ -963,6 +1464,12 @@ export default function App() {
                             {selectedJob ? (selectedJob.allow_whisper_fallback ? "allowed" : "disabled") : "-"}
                           </div>
                         </div>
+                        {selectedJob?.error && (
+                          <div className="debug-span-2">
+                            <div className="muted">Failure detail</div>
+                            <div className="debug-error-text">{selectedJob.error}</div>
+                          </div>
+                        )}
                       </div>
                     </details>
                   </section>
@@ -1012,8 +1519,12 @@ export default function App() {
                   onChange={(event) => setSearchCreatedBefore(event.target.value)}
                 />
               </div>
-              <button type="submit">Run Search</button>
+              <button type="submit" disabled={searchBusy || !searchQ.trim()}>
+                {searchBusy ? "Searching..." : "Run Search"}
+              </button>
             </form>
+
+            {searchBusy && <div className="loading-state">Searching across your transcripts...</div>}
 
             <h3>Answer</h3>
             {searchResult?.answer ? (

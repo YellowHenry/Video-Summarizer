@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,9 +47,11 @@ COOKIE_AUTH_REQUIRED_MARKERS = (
 )
 
 
-def _update_job_status(job: JobRecord, session, status: str, error: str | None = None) -> None:
+def _update_job_status(job: JobRecord, session, status: str, error: str | None = None, **fields) -> None:
     job.status = status
     job.error = error
+    for key, value in fields.items():
+        setattr(job, key, value)
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -344,7 +347,7 @@ def process_job(job_id: str) -> None:
                 logger.warning("Failed to clear vectors table for non-indexed job %s: %s", job.id, exc)
 
         job.error = None
-        _update_job_status(job, session, "complete")
+        _update_job_status(job, session, "complete", completed_at=job.completed_at or datetime.now(timezone.utc))
         session.add(job)
         session.commit()
     except Exception as exc:  # noqa: BLE001

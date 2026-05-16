@@ -4,6 +4,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, Set
 
 from sqlalchemy import delete, or_, select, text
@@ -11,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from backend.vector_store import VectorRecord
 
-from .models import ChatMessage, JobArtifact, JobRecord, VectorChunk
+from .models import ChatMessage, DigestPreference, DigestRun, JobArtifact, JobRecord, VectorChunk
 
 
 @dataclass
@@ -74,6 +75,91 @@ class MetadataStore:
             select(JobRecord.id).where(JobRecord.owner_email == owner_email.strip().lower())
         ).all()
         return {str(row[0]) for row in rows}
+
+    def get_digest_preference(self, owner_email: str) -> DigestPreference | None:
+        normalized_owner = owner_email.strip().lower()
+        return self.session.get(DigestPreference, normalized_owner)
+
+    def upsert_digest_preference(self, owner_email: str, **fields) -> DigestPreference:
+        normalized_owner = owner_email.strip().lower()
+        row = self.session.get(DigestPreference, normalized_owner)
+        if not row:
+            row = DigestPreference(owner_email=normalized_owner)
+        for key, value in fields.items():
+            setattr(row, key, value)
+        self.session.add(row)
+        self.session.commit()
+        self.session.refresh(row)
+        return row
+
+    def list_due_digest_preferences(self, now_utc: datetime) -> list[DigestPreference]:
+        stmt = (
+            select(DigestPreference)
+            .where(
+                DigestPreference.enabled.is_(True),
+                DigestPreference.next_send_at.is_not(None),
+                DigestPreference.next_send_at <= now_utc,
+            )
+            .order_by(DigestPreference.next_send_at.asc(), DigestPreference.owner_email.asc())
+        )
+        return self.session.execute(stmt).scalars().all()
+
+    def create_digest_run(self, **fields) -> DigestRun:
+        row = DigestRun(**fields)
+        self.session.add(row)
+        self.session.commit()
+        self.session.refresh(row)
+        return row
+
+    def update_digest_run(self, run: DigestRun, **fields) -> DigestRun:
+        for key, value in fields.items():
+            setattr(run, key, value)
+        self.session.add(run)
+        self.session.commit()
+        self.session.refresh(run)
+        return run
+
+    def list_digest_runs(self, owner_email: str, limit: int = 5) -> list[DigestRun]:
+        normalized_owner = owner_email.strip().lower()
+        stmt = (
+            select(DigestRun)
+            .where(DigestRun.owner_email == normalized_owner)
+            .order_by(DigestRun.created_at.desc(), DigestRun.id.desc())
+            .limit(max(1, int(limit)))
+        )
+        return self.session.execute(stmt).scalars().all()
+
+    def list_completed_jobs_for_profile(self, owner_email: str, limit: int) -> list[JobRecord]:
+        normalized_owner = owner_email.strip().lower()
+        stmt = (
+            select(JobRecord)
+            .where(
+                JobRecord.owner_email == normalized_owner,
+                JobRecord.status == "complete",
+                JobRecord.completed_at.is_not(None),
+            )
+            .order_by(JobRecord.completed_at.desc(), JobRecord.updated_at.desc())
+            .limit(max(1, int(limit)))
+        )
+        return self.session.execute(stmt).scalars().all()
+
+    def list_completed_jobs_in_window(
+        self,
+        owner_email: str,
+        start_exclusive: datetime | None,
+        end_inclusive: datetime,
+    ) -> list[JobRecord]:
+        normalized_owner = owner_email.strip().lower()
+        stmt = select(JobRecord).where(
+            JobRecord.owner_email == normalized_owner,
+            JobRecord.status == "complete",
+            JobRecord.completed_at.is_not(None),
+            JobRecord.completed_at <= end_inclusive,
+        )
+        if start_exclusive is not None:
+            stmt = stmt.where(JobRecord.completed_at > start_exclusive)
+        stmt = stmt.order_by(JobRecord.completed_at.desc(), JobRecord.updated_at.desc())
+        return self.session.execute(stmt).scalars().all()
 
     def update_job(self, job: JobRecord, **fields) -> JobRecord:
         for key, value in fields.items():

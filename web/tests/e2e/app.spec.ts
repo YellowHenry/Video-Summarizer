@@ -9,6 +9,10 @@ test("@verify @request submit job flow + persisted job chat rendering", async ({
   await setupMockApi(page);
 
   await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Email Digests" })).toBeVisible();
+  await expect(
+    page.getByText("Your next digest will include older completed jobs from before you enabled digests.")
+  ).toHaveCount(0);
   await page.getByLabel("YouTube URL").fill("https://www.youtube.com/watch?v=e2e123");
   await page.getByRole("button", { name: "Submit" }).click();
 
@@ -20,6 +24,9 @@ test("@verify @request submit job flow + persisted job chat rendering", async ({
   await page.locator(".job-table tbody tr").first().click();
   await expect(page.locator(".jobs-list-card")).toHaveCount(1);
   await expect(page.locator(".detail-title", { hasText: "Mock Video Title" })).toBeVisible();
+  await expect(page.getByLabel("Job progress")).toContainText("Processing timeline");
+  await expect(page.getByLabel("Job progress")).toContainText("Ready");
+  await expect(page.getByLabel("Job progress")).toContainText("YouTube auto captions");
   await page.getByRole("button", { name: "Hide Jobs" }).first().click();
   await expect(page.locator(".jobs-list-card")).toHaveCount(0);
   await expect(page.locator(".job-detail-card")).toHaveClass(/summary-spotlight/);
@@ -36,6 +43,14 @@ test("@verify @request submit job flow + persisted job chat rendering", async ({
   await page.getByLabel("Question").fill("What topics were discussed?");
   await page.getByRole("button", { name: "Run Search" }).click();
   await expect(page.getByText("Mock global search answer")).toBeVisible();
+
+  await page.getByRole("button", { name: "Jobs" }).click();
+  await page.getByRole("checkbox", { name: "Receive email digests" }).check();
+  await page.getByRole("button", { name: "Save digest settings" }).click();
+  await expect(page.getByText("Digest settings saved.")).toBeVisible();
+  await expect(
+    page.getByText("Your next digest will include older completed jobs from before you enabled digests.")
+  ).toBeVisible();
 
   mkdirSync(STORAGE_STATE_DIR, { recursive: true });
   await page.context().storageState({ path: STORAGE_STATE_PATH });
@@ -117,4 +132,26 @@ test("@verify @request jobs list toggle + summary spotlight", async ({ page }) =
   await page.getByRole("button", { name: "Show Jobs" }).first().click();
   await expect(page.locator(".jobs-list-card")).toHaveCount(1);
   await expect(page.locator(".job-detail-card")).toHaveScreenshot("job-detail-summary-spotlight.png");
+});
+
+test("@verify @request failed job explains failure and can retry", async ({ page }) => {
+  await setupMockApi(page);
+
+  await page.goto("/");
+  await page.getByLabel("YouTube URL").fill("https://www.youtube.com/watch?v=retryable-failure");
+  await page.getByRole("button", { name: "Submit" }).click();
+
+  await expect(page.locator(".detail-title", { hasText: "Blocked YouTube Video" })).toBeVisible();
+  await expect(page.getByLabel("Job progress")).toContainText("Needs attention");
+  await expect(page.getByLabel("Job failure")).toContainText("We could not finish this job.");
+  await expect(page.getByLabel("Job failure")).toContainText("YouTube did not provide");
+  await expect(page.getByText("No summary was generated")).toBeVisible();
+
+  await page.locator(".debug-disclosure").click();
+  await expect(page.getByText("yt-dlp failed to download")).toBeVisible();
+
+  await page.getByRole("button", { name: "Try again" }).click();
+  await expect(page.locator(".detail-title", { hasText: "Mock Video Title" })).toBeVisible();
+  await expect(page.getByLabel("Job progress")).toContainText("Ready");
+  await expect(page.getByText("Mock summary")).toBeVisible();
 });

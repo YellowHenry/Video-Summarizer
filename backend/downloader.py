@@ -28,6 +28,10 @@ FALLBACK_EXTRACTOR_ARGS = [
     "youtube:player_client=web_remix",
     "youtube:player_client=default",
 ]
+COOKIELESS_MEDIA_EXTRACTOR_ARGS = [
+    "youtube:player_client=android_sdkless",
+    "youtube:player_client=android",
+]
 PATH_FALLBACK = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
@@ -75,6 +79,17 @@ def _extra_cli_flags() -> list[str]:
 def _ensure_runtime_path() -> None:
     if not (os.getenv("PATH") or "").strip():
         os.environ["PATH"] = PATH_FALLBACK
+
+
+def _should_retry_cookieless_media(error_text: str | None) -> bool:
+    message = (error_text or "").lower()
+    markers = (
+        "error solving n challenge",
+        "n challenge solving failed",
+        "requested format is not available",
+        "only images are available",
+    )
+    return any(marker in message for marker in markers)
 
 
 def _chrome_user_data_root() -> Path:
@@ -237,6 +252,43 @@ class AudioDownloader:
                 sleep_backoff(self.proxy_config, attempt_idx)
                 continue
             break
+
+        if _should_retry_cookieless_media(last_error):
+            self.logger.warning(
+                "yt-dlp title lookup retrying without cookies after media-format failure submitted_url=%s normalized_url=%s last_error=%s",
+                url,
+                normalized_url,
+                (last_error or "").splitlines()[0] if last_error else "",
+            )
+            for extractor_arg in COOKIELESS_MEDIA_EXTRACTOR_ARGS:
+                ydl_opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "skip_download": True,
+                    "extract_flat": False,
+                    "noplaylist": True,
+                    "extractor_args": {"youtube": [extractor_arg]},
+                }
+                if JS_RUNTIMES:
+                    ydl_opts["js_runtimes"] = _js_runtime_dict()
+                if REMOTE_COMPONENTS:
+                    ydl_opts["remote_components"] = REMOTE_COMPONENTS
+                try:
+                    self.logger.info(
+                        "yt-dlp title cookieless fallback extractor=%s egress=direct",
+                        extractor_arg,
+                    )
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(normalized_url, download=False)
+                        resolved_info = unwrap_ytdlp_video_info(info, target_video_id)
+                        if isinstance(resolved_info, dict) and resolved_info.get("title"):
+                            return str(resolved_info["title"])
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.debug(
+                        "Cookieless title fallback failed extractor=%s error=%s",
+                        extractor_arg,
+                        exc,
+                    )
         return None
 
     def _resolve_ffmpeg(self) -> Optional[str]:
@@ -325,54 +377,83 @@ class AudioDownloader:
             target_video_id or "unknown",
         )
         last_error: Optional[str] = None
-        for attempt_idx in range(proxy_attempts):
-            proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=normalized_url)
-            proxy_slot = proxy_index(self.proxy_config, proxy_url)
-            proxy_label = redact_proxy(proxy_url)
-            rate_limited_this_round = False
 
-            for extractor_arg, cookies_label, cookies_flags in attempt_matrix:
-                proxy_flags = ["--proxy", proxy_url] if proxy_url else []
-                attempt = base_common + ["--extractor-args", extractor_arg] + cookies_flags + proxy_flags + [normalized_url]
-                self.logger.info(
-                    "yt-dlp attempt extractor=%s cookies=%s egress=%s proxy_slot=%s attempt=%s/%s",
-                    extractor_arg,
-                    cookies_label,
-                    proxy_label,
-                    proxy_slot or "n/a",
-                    attempt_idx + 1,
-                    proxy_attempts,
-                )
-                try:
-                    run_env = os.environ.copy()
-                    if not (run_env.get("PATH") or "").strip():
-                        run_env["PATH"] = PATH_FALLBACK
-                    result = subprocess.run(attempt, check=True, capture_output=True, text=True, env=run_env)
-                    if output_path.exists():
-                        return output_path, title
-                    temp_files = list(temp_dir.glob("*"))
-                    if temp_files:
-                        for f in temp_files:
-                            if f.suffix in (".mp4", ".webm", ".mkv", ".m4a", ".mp3") and f.name != "download_error.log":
-                                return f, title
-                    last_error = f"yt-dlp completed but no audio file was created. Output: {result.stdout}"
-                except subprocess.CalledProcessError as exc:  # noqa: PERF203
-                    err_text = exc.stderr or exc.stdout or str(exc)
-                    last_error = err_text
-                    if is_rate_limited_error(err_text):
-                        rate_limited_this_round = True
+        def _run_download_matrix(
+            matrix: list[tuple[str, str, list[str]]],
+            *,
+            phase_label: str,
+        ) -> tuple[Optional[Path], Optional[str]]:
+            nonlocal last_error
+            for attempt_idx in range(proxy_attempts):
+                proxy_url = select_proxy_for_attempt(self.proxy_config, attempt_idx, stable_key=normalized_url)
+                proxy_slot = proxy_index(self.proxy_config, proxy_url)
+                proxy_label = redact_proxy(proxy_url)
+                rate_limited_this_round = False
+
+                for extractor_arg, cookies_label, cookies_flags in matrix:
+                    proxy_flags = ["--proxy", proxy_url] if proxy_url else []
+                    attempt = base_common + ["--extractor-args", extractor_arg] + cookies_flags + proxy_flags + [normalized_url]
+                    self.logger.info(
+                        "yt-dlp attempt phase=%s extractor=%s cookies=%s egress=%s proxy_slot=%s attempt=%s/%s",
+                        phase_label,
+                        extractor_arg,
+                        cookies_label,
+                        proxy_label,
+                        proxy_slot or "n/a",
+                        attempt_idx + 1,
+                        proxy_attempts,
+                    )
+                    try:
+                        run_env = os.environ.copy()
+                        if not (run_env.get("PATH") or "").strip():
+                            run_env["PATH"] = PATH_FALLBACK
+                        result = subprocess.run(attempt, check=True, capture_output=True, text=True, env=run_env)
+                        if output_path.exists():
+                            return output_path, title
+                        temp_files = list(temp_dir.glob("*"))
+                        if temp_files:
+                            for f in temp_files:
+                                if f.suffix in (".mp4", ".webm", ".mkv", ".m4a", ".mp3") and f.name != "download_error.log":
+                                    return f, title
+                        last_error = f"yt-dlp completed but no audio file was created. Output: {result.stdout}"
+                    except subprocess.CalledProcessError as exc:  # noqa: PERF203
+                        err_text = exc.stderr or exc.stdout or str(exc)
+                        last_error = err_text
+                        if is_rate_limited_error(err_text):
+                            rate_limited_this_round = True
+                        continue
+
+                if rate_limited_this_round and attempt_idx + 1 < proxy_attempts:
+                    self.logger.warning(
+                        "yt-dlp download rate-limited phase=%s (proxy_slot=%s attempt=%s/%s). Rotating.",
+                        phase_label,
+                        proxy_slot or "n/a",
+                        attempt_idx + 1,
+                        proxy_attempts,
+                    )
+                    sleep_backoff(self.proxy_config, attempt_idx)
                     continue
+                break
+            return None, None
 
-            if rate_limited_this_round and attempt_idx + 1 < proxy_attempts:
-                self.logger.warning(
-                    "yt-dlp download rate-limited (proxy_slot=%s attempt=%s/%s). Rotating.",
-                    proxy_slot or "n/a",
-                    attempt_idx + 1,
-                    proxy_attempts,
-                )
-                sleep_backoff(self.proxy_config, attempt_idx)
-                continue
-            break
+        downloaded_path, downloaded_title = _run_download_matrix(attempt_matrix, phase_label="cookie-auth")
+        if downloaded_path is not None:
+            return downloaded_path, downloaded_title
+
+        if _should_retry_cookieless_media(last_error):
+            self.logger.warning(
+                "yt-dlp audio retrying without cookies after media-format failure submitted_url=%s normalized_url=%s last_error=%s",
+                url,
+                normalized_url,
+                (last_error or "").splitlines()[0] if last_error else "",
+            )
+            cookieless_matrix = [
+                (extractor_arg, "none", [])
+                for extractor_arg in COOKIELESS_MEDIA_EXTRACTOR_ARGS
+            ]
+            downloaded_path, downloaded_title = _run_download_matrix(cookieless_matrix, phase_label="cookieless-fallback")
+            if downloaded_path is not None:
+                return downloaded_path, downloaded_title
 
         error_log = temp_dir / "download_error.log"
         if last_error:

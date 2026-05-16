@@ -66,8 +66,19 @@ if ! gcp_has_python; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_local_env_file="${SCRIPT_DIR}/env.sh"
+if [[ -f "${_local_env_file}" ]]; then
+  # Local deployment values and secrets live here. The file is gitignored.
+  set -a
+  # shellcheck source=/dev/null
+  source "${_local_env_file}"
+  set +a
+fi
+
 _py_exports="$(gcp_run_python "${SCRIPT_DIR}/load_python_env.py" 2>/dev/null || true)"
 if [[ -n "${_py_exports}" ]]; then
   eval "${_py_exports}"
 fi
 unset _py_exports
+unset _local_env_file

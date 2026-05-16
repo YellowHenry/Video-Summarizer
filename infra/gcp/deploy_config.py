@@ -37,9 +37,24 @@ class DeployConfig:
     REDIS_VM_ALLOWED_SOURCE: Optional[str] = None
     BUCKET_NAME: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
+    OPENAI_SECRET_NAME: Optional[str] = None
     GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
     OPENAI_TRUST_ENV_PROXY: str = "false"
     SUMMARIZER_MAX_TOKENS: str = "800"
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: str = "587"
+    SMTP_USER: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_FROM: Optional[str] = None
+    WEB_APP_BASE_URL: Optional[str] = None
+    DIGEST_SWEEP_SECRET: Optional[str] = None
+    DIGEST_SWEEP_INTERVAL_MINUTES: str = "15"
+    DIGEST_PROFILE_MAX_JOBS: str = "20"
+    DIGEST_MAX_ITEMS_PER_EMAIL: str = "10"
+    DIGEST_JOB_EXCERPT_CHARS: str = "240"
+    DIGEST_SEND_HOUR_LOCAL: str = "8"
+    DIGEST_WEEKLY_WEEKDAY: str = "0"
+    DIGEST_SWEEP_JOB_NAME: str = "audio-summarizer-digest-sweep"
 
     # Optional with defaults
     NETWORK: str = "default"
@@ -115,27 +130,24 @@ class DeployConfig:
     BACKFILL_ENABLE_EMBEDDINGS: str = "true"
 
 
-#CONFIG = DeployConfig()
+# Keep this file publish-safe. Put real project IDs, passwords, proxy URLs,
+# OAuth client IDs, SMTP credentials, and digest secrets in ignored
+# infra/gcp/env.sh or shell environment variables.
 CONFIG = DeployConfig(
-    PROJECT_ID="tribal-primer-438802-n0",
     REPO="capstone-repo",
-    DB_PASSWORD="1e344de5940d4378ac21fc80ae03dccb",
-    BUCKET_NAME="tribal-primer-438802-n0-capstone-artifacts",
+    SQL_STORAGE_TYPE="HDD",
     WORKER_RUNTIME="compute_engine",
     SQL_TIER="db-f1-micro",
-    WORKER_VM_MACHINE_TYPE="e2-medium",
-    OPENAI_API_KEY=None,  # uses backend/config.py fallback
+    WORKER_VM_MACHINE_TYPE="e2-small",
+    WORKER_VM_DISK_SIZE_GB="32",
+    OPENAI_SECRET_NAME="openai-api-key",
     SUMMARIZER_MAX_TOKENS="1500",
-    YTDLP_COOKIES_FILE=None,
     REDIS_RUNTIME="worker_vm",
-    REDIS_VM_REQUIREPASS="NWn6OP6zik6Jyi0uloVXVA3kbJJSiaVO",
-    PROXY_ENABLED="true",
+    PROXY_ENABLED="false",
     PROXY_CAPTIONS_ONLY="true",
     PROXY_ROTATION_MODE="on_rate_limit",
     PROXY_MAX_RETRIES="3",
     PROXY_BACKOFF_SECONDS="2",
-    PROXY_POOL="http://vucelhug-rotate:8bzu3fwqvpuy@p.webshare.io:80",
-    GOOGLE_OAUTH_CLIENT_ID="1075336295658-qcfbcm3v3nf35rgf00abdj8he3hcih0t.apps.googleusercontent.com",
 )
 
 def _fallback_openai_key() -> Optional[str]:
@@ -220,7 +232,7 @@ def _apply_proxy_env(values: dict[str, Optional[str]]) -> None:
 
 def get_deploy_env() -> dict[str, str]:
     values = asdict(CONFIG)
-    if not values.get("OPENAI_API_KEY"):
+    if not values.get("OPENAI_API_KEY") and not values.get("OPENAI_SECRET_NAME"):
         values["OPENAI_API_KEY"] = _fallback_openai_key()
     _apply_proxy_env(values)
 

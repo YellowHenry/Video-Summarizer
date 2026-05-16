@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -106,3 +106,39 @@ class SearchHit(BaseModel):
 class SearchResponse(BaseModel):
     answer: str
     hits: list[SearchHit]
+
+
+class DigestSettingsResponse(BaseModel):
+    enabled: bool
+    cadence: Literal["daily", "weekly"]
+    timezone: str
+    send_hour_local: int
+    weekly_weekday: int
+    recipient_email: str
+    delivery_available: bool
+    delivery_reason: Optional[str] = None
+    next_send_at: Optional[datetime] = None
+    last_run_at: Optional[datetime] = None
+    last_run_status: Optional[str] = None
+    last_sent_at: Optional[datetime] = None
+    profile_summary: Optional[str] = None
+    profile_updated_at: Optional[datetime] = None
+    historical_backfill_pending: bool = False
+
+
+class UpdateDigestSettingsRequest(BaseModel):
+    enabled: bool
+    cadence: Literal["daily", "weekly"] = "daily"
+    timezone: str = "UTC"
+
+
+class DigestRunOut(BaseModel):
+    id: int
+    status: str
+    cadence: str
+    job_count: int
+    subject: Optional[str] = None
+    window_start_at: Optional[datetime] = None
+    window_end_at: Optional[datetime] = None
+    created_at: datetime
+    sent_at: Optional[datetime] = None
